@@ -8,7 +8,7 @@
 
 ## Overview
 
-**Pinecone Ingestor** is a Streamlit web application designed to help you build and manage a Retrieval-Augmented Generation (RAG) knowledge base. It enables ingestion of diverse document types into a Pinecone vector database by leveraging LangChain's `UnstructuredLoader` and advanced document processing pipelines.
+**Pinecone Ingestor** is a Streamlit web application designed to help you build and manage a Retrieval-Augmented Generation (RAG) knowledge base using Pinecone vector database. It enables ingestion of diverse document types into a Pinecone vector database by leveraging LangChain's `UnstructuredLoader` and advanced document processing pipelines.
 
 ---
 
