@@ -92,7 +92,7 @@ Open your browser and navigate to:
 http://localhost:8501
 ```
 
-You should see the Pinecone RAG Knowledge Base Ingestion Tool UI.
+You should see the Pinecone Ingestor UI.
 
 ---
 
