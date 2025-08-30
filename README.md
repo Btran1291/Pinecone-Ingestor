@@ -28,8 +28,8 @@
 ### Clone the Repository
 
 ```bash
-git clone https://github.com/yourusername/pinecone-rag-ingestion-tool.git
-cd pinecone-rag-ingestion-tool
+git clone https://github.com/Btran1291/Pinecone-Ingestor.git
+cd Pinecone-Ingestor
 ```
 
 ---
@@ -67,7 +67,7 @@ LOGGING_LEVEL="INFO"
 Build the Docker image using the provided `Dockerfile`:
 
 ```bash
-docker build -t pinecone-rag-app .
+docker build -t pinecone-ingestor .
 ```
 
 > **Note:** The Docker image is quite large (~14GB) due to the inclusion of multiple system dependencies (Poppler, Tesseract, LibreOffice, Pandoc, etc.) required for comprehensive document parsing. As a result, building the image may take awhile depending on your machine and network speed.
@@ -79,7 +79,7 @@ docker build -t pinecone-rag-app .
 Run the container, mapping port 8501 and passing environment variables:
 
 ```bash
-docker run -p 8501:8501 --env-file .env pinecone-rag-app
+docker run -p 8501:8501 --env-file .env pinecone-ingestor
 ```
 
 ---
