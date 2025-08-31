@@ -164,10 +164,10 @@ The Docker image includes all necessary system dependencies for document parsing
 
 ### Install Poetry Dependencies Locally
 
-If you want to run the app locally without Docker:
+If you want to run the app locally without Docker (make sure you have Python 3.11 and Poetry install in your system):
 
 ```bash
-poetry install
+poetry install --no-root
 poetry run streamlit run app.py
 ```
 
