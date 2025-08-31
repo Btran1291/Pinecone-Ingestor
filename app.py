@@ -228,61 +228,6 @@ def count_tokens(text: str, model_name: str, logger: logging.Logger) -> int:
         logger.error(f"Error counting tokens for model '{model_name}': {e}")
         return len(text) // 3
 
-def get_estimated_base_metadata_overhead(
-    parsed_global_custom_metadata: dict,
-    document_specific_metadata_map: dict,
-    file_names_in_batch: list[str],
-    logger: logging.Logger
-) -> int:
-    """
-    Estimates the maximum possible byte size of metadata (excluding the 'text' field)
-    to calculate the safe maximum text size for a chunk, adhering to Pinecone's metadata limits.
-    Considers reserved keys, global custom metadata, and document-specific metadata.
-    """
-    dummy_metadata = {}
-
-    # Estimate overhead from reserved internal keys using max possible lengths
-    dummy_metadata["document_id"] = "a" * 64
-    longest_file_name_placeholder = "placeholder_file_name_for_estimation_very_long_indeed_123456789012345678901234567890.pdf"
-    longest_file_name = max(file_names_in_batch, key=len) if file_names_in_batch else longest_file_name_placeholder
-    dummy_metadata["file_name"] = longest_file_name
-    dummy_metadata["page_number"] = 9999
-    dummy_metadata["start_index"] = 99999999
-    dummy_metadata["category"] = "LongestCategoryNamePossible"
-    dummy_metadata["original_file_path"] = "/path/to/a/very/long/original/file/name/on/user/machine/that/might/be/stored/long_path_long_name.pdf"
-
-    # Include global custom metadata in the overhead estimation
-    for k, v in parsed_global_custom_metadata.items():
-        if k not in RESERVED_METADATA_KEYS:
-            if isinstance(v, (str, int, float, bool, list, dict)):
-                dummy_metadata[k] = v
-            else:
-                dummy_metadata[k] = str(v)
-
-    # Include document-specific metadata in the overhead estimation (find the largest one)
-    max_doc_specific_md_size = 0
-    best_doc_specific_md_for_estimation = {}
-    for file_name, doc_md in document_specific_metadata_map.items():
-        temp_md = {}
-        for k, v in doc_md.items():
-            if k not in RESERVED_METADATA_KEYS:
-                if isinstance(v, (str, int, float, bool, list, dict)):
-                    temp_md[k] = v
-                else:
-                    temp_md[k] = str(v)
-        current_size = len(json.dumps(temp_md).encode("utf-8"))
-        if current_size > max_doc_specific_md_size:
-            max_doc_specific_md_size = current_size
-            best_doc_specific_md_for_estimation = temp_md
-
-    for k, v in best_doc_specific_md_for_estimation.items():
-        if k not in RESERVED_METADATA_KEYS:
-            dummy_metadata[k] = v
-
-    overhead_bytes = len(json.dumps(dummy_metadata).encode("utf-8"))
-    logger.debug(f"Estimated base metadata overhead: {overhead_bytes} bytes with dummy: {dummy_metadata}")
-    return overhead_bytes
-
 # Recommended allowed keys and priority list (highest -> lowest)
 RAG_ALLOWED_KEYS = [
     "text", 
@@ -618,14 +563,8 @@ def _merge_chunk_metadata(meta1: dict, meta2: dict, logger: logging.Logger) -> d
             if merged_meta[k] != v:
                 logger.debug(f"Metadata key '{k}' differs during merge: '{merged_meta[k]}' vs '{v}'. Keeping '{merged_meta[k]}'.")
 
-    # Ensure final merged metadata is canonicalized and filtered (e.g., removes RAG_DISCARD_KEYS again)
-    # This also handles custom metadata merging from global/doc-specific sources if not done earlier
-    final_cleaned_merged_meta = _canonicalize_and_filter_metadata(
-        merged_meta,
-        logger
-    )
-    
-    return final_cleaned_merged_meta
+    return merged_meta
+
 
 
 # -------- Adaptive Document Structure Analysis --------
@@ -1033,6 +972,7 @@ def _generate_semantic_chunks(
     document_id: str,
     file_name: str,
     sentence_split_threshold_chars: int,
+    min_chunk_length: int,
     logger: logging.Logger
 ) -> list[Document]:
     """
@@ -1210,7 +1150,7 @@ def _generate_semantic_chunks(
     while i < len(chunks_with_overlap):
         current_chunk = chunks_with_overlap[i]
         
-        if len(current_chunk.page_content) < min_chunk_length_ui:
+        if len(current_chunk.page_content) < min_chunk_length:
             logger.debug(f"Chunk {i} ('{current_chunk.metadata.get('chunk_id', 'N/A')}') is short ({len(current_chunk.page_content)} chars). Attempting to merge.")
             
             merged = False
@@ -2390,14 +2330,15 @@ def main():
                     file_specific_final_chunks = _generate_semantic_chunks(
                         meaningful_chunks=meaningful_chunks,
                         document_outline=document_outline,
-                        user_chunk_size=chunk_size, # User-defined chunk size
-                        user_chunk_overlap=chunk_overlap, # User-defined chunk overlap
+                        user_chunk_size=chunk_size,
+                        user_chunk_overlap=chunk_overlap,
                         pinecone_metadata_max_bytes=PINECONE_METADATA_MAX_BYTES,
                         parsed_global_custom_metadata=parsed_global_custom_metadata,
                         document_specific_metadata_map=document_specific_metadata_map,
                         document_id=document_id,
                         file_name=file_name,
-                        sentence_split_threshold_chars=sentence_split_threshold_chars_ui, # Pass new UI param
+                        sentence_split_threshold_chars=sentence_split_threshold_chars_ui,
+                        min_chunk_length=min_chunk_length_ui,
                         logger=logger
                     )
                     status_container.write(f"✅ Layer 3: Final semantic chunks generated: {len(file_specific_final_chunks)} chunks.")
