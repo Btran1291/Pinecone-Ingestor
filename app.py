@@ -18,6 +18,16 @@ import pandas as pd
 import io
 import tiktoken
 import spacy
+import numpy as np
+import nltk
+import re
+
+try:
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    nltk.download('punkt', quiet=True)
+except Exception as e:
+    print(f"An unexpected error occurred during NLTK data download: {e}")
 
 # -------- Logging Configuration --------
 class StreamlitLogHandler(logging.Handler):
@@ -71,14 +81,17 @@ DEFAULT_SETTINGS = {
     "NAMESPACE": "",
     "CHUNK_SIZE": "1000",
     "CHUNK_OVERLAP": "200",
-    "CUSTOM_METADATA": "[]",
+    "CUSTOM_METADATA": '[{"key": "", "value": ""}]',
     "OVERWRITE_EXISTING_DOCS": "False",
     "LOGGING_LEVEL": "INFO",
     "ENABLE_FILTERING": "True",
     "WHITELISTED_KEYWORDS": "",
-    "MIN_GENERIC_CONTENT_LENGTH": "50",
+    "MIN_GENERIC_CONTENT_LENGTH": "120",
     "ENABLE_NER_FILTERING": "True",
     "UNSTRUCTURED_STRATEGY": "hi_res",
+    "HEADING_DETECTION_CONFIDENCE_THRESHOLD": "0.65",
+    "MIN_CHUNKS_PER_SECTION_FOR_MERGE": "2",
+    "SENTENCE_SPLIT_THRESHOLD_CHARS": "300", 
 }
 
 # Supported Pinecone cloud regions and their corresponding cloud/region values for ServerlessSpec
@@ -105,8 +118,8 @@ OPENAI_MAX_TOKENS_PER_EMBEDDING_REQUEST = 300000
 OPENAI_MAX_TEXTS_PER_EMBEDDING_REQUEST = 1000
 
 # Categories from Unstructured.io that are considered important and typically kept during filtering
-IMPORTANT_UNSTRUCTURED_CATEGORIES = {
-    "Title", "NarrativeText", "ListItem", "Table", "FigureCaption", "Formula", "Text"
+STRUCTURAL_CUES_AND_CRITICAL_CONCISE_CONTENT = {
+    "Title", "NarrativeText", "ListItem", "Table", "FigureCaption", "Formula", "Header", "Subheader"
 }
 
 # Metadata keys reserved for internal use or special handling within Pinecone
@@ -151,9 +164,13 @@ def save_uploaded_file_to_temp(uploaded_file):
             f.write(file_bytes)
         logger.info(f"Successfully saved {uploaded_file.name} to temporary path: {file_path}")
         return file_path, temp_dir, file_bytes
-    except Exception as e:
+    except (IOError, OSError) as e:
         logger.exception(f"Error saving uploaded file {uploaded_file.name}")
         st.error(f"Error saving uploaded file: {e}")
+        return None, None, None
+    except Exception as e:
+        logger.exception(f"An unexpected error occurred while saving uploaded file {uploaded_file.name}")
+        st.error(f"An unexpected error occurred: {e}")
         return None, None, None
 
 def is_running_locally():
@@ -264,6 +281,789 @@ def get_estimated_base_metadata_overhead(
     overhead_bytes = len(json.dumps(dummy_metadata).encode("utf-8"))
     logger.debug(f"Estimated base metadata overhead: {overhead_bytes} bytes with dummy: {dummy_metadata}")
     return overhead_bytes
+
+# Recommended allowed keys and priority list (highest -> lowest)
+RAG_ALLOWED_KEYS = [
+    "text", 
+    "chunk_id",
+    "document_id",
+    "file_name",
+    "section_id",
+    "section_heading",
+    "heading_level",
+    "chunk_confidence",
+    "chunk_index_in_section",
+    "total_chunks_in_section",
+    "page_number",
+    "languages",
+    "filetype",
+    "last_modified",
+]
+
+# Keys to always remove (sensitive or irrelevant)
+RAG_DISCARD_KEYS = {
+    "file_directory", "original_file_path", "source", "filename",
+    "element_id", "parent_id", "coordinates", "start_index", "page", "file_path"
+}
+
+def _canonicalize_and_filter_metadata(
+    raw_meta: dict,
+    global_custom_md: dict,
+    doc_specific_md: dict,
+    logger: logging.Logger
+) -> dict:
+    """
+    Return a cleaned metadata dict that:
+    - canonicalizes duplicates (e.g., 'filename' -> 'file_name'),
+    - removes definitely irrelevant keys,
+    - merges/validates custom metadata (global first, then doc-specific overrides),
+    - ensures primitive types (strings/numbers/bools) or JSON-stringified values for lists/dicts.
+    Note: Does NOT yet ensure byte-size under pinecone limit; see shrink_to_limit below.
+    """
+    cleaned = {}
+
+    # 1) Work on a shallow copy to avoid mutating caller's meta
+    meta = dict(raw_meta or {})
+
+    # Canonicalize: prefer 'file_name', but accept 'filename' as fallback
+    if "file_name" not in meta and "filename" in meta:
+        meta["file_name"] = meta.pop("filename")
+
+    # Remove discard keys early
+    for k in list(meta.keys()):
+        if k in RAG_DISCARD_KEYS:
+            logger.debug(f"Removing discarded metadata key '{k}'.")
+            meta.pop(k, None)
+
+    # Keep keys that are probably useful; others can be considered custom if requested
+    for k, v in meta.items():
+        # Skip None or empty values
+        if v is None:
+            continue
+
+        # Convert allowed types to safe serializable types
+        if isinstance(v, (str, int, float, bool)):
+            cleaned[k] = v
+        elif isinstance(v, (list, dict)):
+            # For lists/dicts, JSON stringify but keep small ones as structured lists if short strings
+            try:
+                json_repr = json.dumps(v)
+                cleaned[k] = json.loads(json_repr) if (isinstance(v, list) and all(isinstance(i, str) for i in v)) else json_repr
+            except Exception:
+                cleaned[k] = str(v)
+                logger.debug(f"Converted non-serializable metadata key '{k}' to string.")
+        else:
+            # Fallback to string
+            cleaned[k] = str(v)
+            logger.debug(f"Converted metadata key '{k}' of type {type(v)} to string.")
+
+    # 2) Merge global and document-specific custom metadata (document-specific overrides)
+    for k, v in (global_custom_md or {}).items():
+        if not k or k in RESERVED_METADATA_KEYS:  # keep reserved protection
+            logger.debug(f"Ignoring global custom metadata key '{k}' (reserved or empty).")
+            continue
+        # Convert types similarly
+        if isinstance(v, (str, int, float, bool)):
+            cleaned.setdefault(k, v)
+        else:
+            try:
+                cleaned.setdefault(k, json.dumps(v))
+            except Exception:
+                cleaned.setdefault(k, str(v))
+
+    # doc_specific overrides
+    for k, v in (doc_specific_md or {}).items():
+        if not k or k in RESERVED_METADATA_KEYS:
+            logger.debug(f"Ignoring doc-specific metadata key '{k}' (reserved or empty).")
+            continue
+        if isinstance(v, (str, int, float, bool)):
+            cleaned[k] = v
+        else:
+            try:
+                cleaned[k] = json.dumps(v)
+            except Exception:
+                cleaned[k] = str(v)
+
+    # 3) Ensure canonical keys exist where relevant
+    if "file_name" not in cleaned and "document_id" in cleaned:
+        # no filename available; that's okay, do not invent it
+        pass
+
+    return cleaned
+
+
+def _shrink_metadata_to_limit(metadata: dict, logger: logging.Logger, pinecone_metadata_max_bytes: int = PINECONE_METADATA_MAX_BYTES) -> dict:
+    """
+    Ensure metadata JSON byte size <= pinecone_metadata_max_bytes.
+    Strategy:
+      1) Keep highest priority keys in RAG_ALLOWED_KEYS. Remove keys not in allowed list while respecting allowed custom keys
+         (we allow additional keys but prefer RAG_ALLOWED_KEYS first).
+      2) If still too big, remove lower-priority allowed keys in reverse priority order.
+      3) If still too big, truncate the 'text' field (as last resort) and mark text_truncated=True.
+    Returns the pruned metadata (may be modified).
+    """
+    # Quick check
+    try:
+        metadata_json = json.dumps(metadata)
+    except TypeError:
+        # Try converting all non-serializable entries to strings first
+        safe_meta = {}
+        for k, v in metadata.items():
+            try:
+                json.dumps({k: v})
+                safe_meta[k] = v
+            except Exception:
+                safe_meta[k] = str(v)
+        metadata = safe_meta
+        metadata_json = json.dumps(metadata)
+
+    size = len(metadata_json.encode("utf-8"))
+    if size <= pinecone_metadata_max_bytes:
+        return metadata
+
+    logger.warning(f"Metadata size {size} bytes exceeds limit {pinecone_metadata_max_bytes} bytes. Beginning shrink process.")
+
+    # Build prioritized keys to keep: start with RAG_ALLOWED_KEYS in order, then any remaining small custom keys
+    prioritized = [k for k in RAG_ALLOWED_KEYS if k in metadata]
+    # Add other keys by ascending length of their JSON repr (shorter first)
+    other_keys = [k for k in metadata.keys() if k not in prioritized]
+    other_keys_sorted = sorted(other_keys, key=lambda k: len(json.dumps({k: metadata[k]})))
+    prioritized.extend(other_keys_sorted)
+
+    # Try removing lowest priority items first (reverse of prioritized)
+    pruned = dict(metadata)  # copy
+    for key in reversed(prioritized):
+        if len(json.dumps(pruned).encode("utf-8")) <= pinecone_metadata_max_bytes:
+            break
+        if key == "text":
+            # don't remove text yet
+            continue
+        if key in pruned:
+            logger.debug(f"Removing metadata key '{key}' to reduce size.")
+            pruned.pop(key, None)
+
+    # If still too big, attempt to remove other keys not in RAG_ALLOWED_KEYS
+    if len(json.dumps(pruned).encode("utf-8")) > pinecone_metadata_max_bytes:
+        for key in list(pruned.keys()):
+            if key not in RAG_ALLOWED_KEYS and key != "text":
+                logger.debug(f"Removing additional non-priority metadata key '{key}'.")
+                pruned.pop(key, None)
+                if len(json.dumps(pruned).encode("utf-8")) <= pinecone_metadata_max_bytes:
+                    break
+
+    # If still too big, truncate the text field
+    if len(json.dumps(pruned).encode("utf-8")) > pinecone_metadata_max_bytes:
+        text = pruned.get("text", "")
+        if text:
+            # Compute allowed bytes for text after accounting for other metadata
+            temp = dict(pruned)
+            temp.pop("text", None)
+            overhead = len(json.dumps(temp).encode("utf-8"))
+            # Reserve small safety margin
+            allowed_for_text = max(0, pinecone_metadata_max_bytes - overhead - SAFETY_BUFFER_BYTES)
+            if allowed_for_text <= 0:
+                # remove text entirely (should be last resort)
+                logger.critical("No room left for 'text' in metadata; removing it as last resort. You should use external text storage.")
+                pruned.pop("text", None)
+                pruned["text_truncated"] = True
+            else:
+                # Determine character count conservatively (UTF-8 worst-case 4 bytes per char)
+                max_chars = allowed_for_text // MAX_UTF8_BYTES_PER_CHAR
+                truncated_text = text[:max_chars]
+                pruned["text"] = truncated_text
+                pruned["text_truncated"] = True
+                logger.warning(f"Truncated 'text' to {len(truncated_text)} chars to fit metadata limit ({pinecone_metadata_max_bytes} bytes).")
+        else:
+            logger.critical("Metadata too large and no 'text' field to shrink. Metadata will be pruned aggressively.")
+            # prune additional keys until we fit
+            for key in list(pruned.keys()):
+                if key != "chunk_id":
+                    pruned.pop(key, None)
+                if len(json.dumps(pruned).encode("utf-8")) <= pinecone_metadata_max_bytes:
+                    break
+
+    final_size = len(json.dumps(pruned).encode("utf-8"))
+    if final_size > pinecone_metadata_max_bytes:
+        logger.error(f"Unable to reduce metadata to {pinecone_metadata_max_bytes} bytes; final size {final_size} bytes. Upsert may fail.")
+    else:
+        logger.debug(f"Shrunk metadata to {final_size} bytes (limit {pinecone_metadata_max_bytes} bytes).")
+
+    return pruned
+
+
+# -------- Adaptive Document Structure Analysis --------
+def _analyze_document_structure(meaningful_chunks: list[Document], logger: logging.Logger) -> dict:
+    """
+    Analyzes the meaningful_chunks to derive statistical and pattern-based insights
+    about the document's inherent structure. This forms Layer 1 of the intelligent chunking.
+    """
+    doc_context = {}
+    
+    if not meaningful_chunks:
+        logger.warning("No meaningful chunks provided for structural analysis. Returning empty context.")
+        return doc_context
+
+    # --- 1. Statistical Text Analysis ---
+    element_lengths = [len(d.page_content) for d in meaningful_chunks if d.page_content]
+    if element_lengths:
+        doc_context["mean_element_length"] = np.mean(element_lengths)
+        doc_context["median_element_length"] = np.median(element_lengths)
+        doc_context["std_dev_element_length"] = np.std(element_lengths)
+        
+        # Optimal derivation for thresholds: using quartiles and IQR for robustness
+        q1 = np.percentile(element_lengths, 25)
+        q3 = np.percentile(element_lengths, 75)
+        iqr = q3 - q1
+        
+        # Elements significantly shorter than Q1 are candidates for headings
+        # Factor of 1.5 is a common heuristic for outlier detection (e.g., in box plots)
+        doc_context["short_element_threshold"] = max(MIN_RE_SPLIT_CHUNK_SIZE, q1 - 1.5 * iqr) 
+        # Elements significantly longer than Q3 are candidates for large paragraphs/sections
+        doc_context["long_element_threshold"] = q3 + 1.5 * iqr 
+    else:
+        doc_context["mean_element_length"] = 0
+        doc_context["median_element_length"] = 0
+        doc_context["std_dev_element_length"] = 0
+        doc_context["short_element_threshold"] = MIN_RE_SPLIT_CHUNK_SIZE # Fallback
+        doc_context["long_element_threshold"] = 0
+
+    all_lines = []
+    for d in meaningful_chunks:
+        all_lines.extend(d.page_content.splitlines())
+
+    # Line-level feature analysis
+    line_features = {
+        "all_caps": [], "title_case": [], "ends_with_punctuation": [],
+        "starts_with_numbering": [], "leading_indent": [], "short_line": []
+    }
+    short_line_char_threshold = 80 # A fixed threshold for line-level analysis
+
+    for line in all_lines:
+        stripped_line = line.strip()
+        if not stripped_line: continue # Skip empty lines for feature analysis
+
+        # Avoid noise from very short lines when checking capitalization
+        if len(stripped_line) > 5: 
+            line_features["all_caps"].append(stripped_line.isupper())
+            line_features["title_case"].append(stripped_line.istitle())
+        
+        line_features["ends_with_punctuation"].append(stripped_line and stripped_line[-1] in ".!?")
+        line_features["starts_with_numbering"].append(bool(re.match(r'^(\d+\.?|\d+\.\d+\.?|[A-Z]\.?|[IVX]+\.)\s', stripped_line)))
+        line_features["leading_indent"].append(len(line) - len(line.lstrip()) > 2) # More than 2 leading spaces
+        line_features["short_line"].append(len(stripped_line) < short_line_char_threshold)
+
+    total_analyzed_lines = len(all_lines)
+    if total_analyzed_lines > 0:
+        doc_context["prevalence_all_caps_lines"] = np.mean(line_features["all_caps"]) if line_features["all_caps"] else 0
+        doc_context["prevalence_title_case_lines"] = np.mean(line_features["title_case"]) if line_features["title_case"] else 0
+        doc_context["prevalence_ends_with_punctuation"] = np.mean(line_features["ends_with_punctuation"])
+        doc_context["prevalence_starts_with_numbering"] = np.mean(line_features["starts_with_numbering"])
+        doc_context["prevalence_leading_indent"] = np.mean(line_features["leading_indent"])
+        doc_context["prevalence_short_lines"] = np.mean(line_features["short_line"])
+    else:
+        doc_context["prevalence_all_caps_lines"] = 0
+        doc_context["prevalence_title_case_lines"] = 0
+        doc_context["prevalence_ends_with_punctuation"] = 0
+        doc_context["prevalence_starts_with_numbering"] = 0
+        doc_context["prevalence_leading_indent"] = 0
+        doc_context["prevalence_short_lines"] = 0
+
+    # Blank Line Analysis (simple heuristic for now, can be refined with raw file bytes if needed)
+    blank_line_sequences = 0
+    consecutive_blank_lines = 0
+    for line in all_lines:
+        if not line.strip():
+            consecutive_blank_lines += 1
+        else:
+            if consecutive_blank_lines >= 2: # Detect sequences of 2 or more blank lines
+                blank_line_sequences += 1
+            consecutive_blank_lines = 0
+    if consecutive_blank_lines >= 2: # Catch sequence at end of document
+        blank_line_sequences += 1
+    
+    doc_context["avg_blank_lines_between_sections"] = blank_line_sequences # Simple count for now
+
+    # --- 2. Adaptive Pattern Identification ---
+    heading_prefixes_candidates = ["Chapter", "Section", "Appendix", "Figure", "Table", "Part", "Article", "Clause", "Introduction", "Conclusion", "Summary"]
+    detected_prefixes = {p: 0 for p in heading_prefixes_candidates}
+    numbering_patterns_counts = {"decimal_multi_level": 0, "decimal_single_level": 0, "alpha_upper": 0, "roman_upper": 0}
+
+    for d in meaningful_chunks:
+        text_start = d.page_content.strip().split('\n')[0] # Only check first line for patterns
+        
+        # Common Prefixes
+        for prefix in heading_prefixes_candidates:
+            if text_start.lower().startswith(prefix.lower()):
+                detected_prefixes[prefix] += 1
+        
+        # Dominant Numbering Schemes
+        if re.match(r'^\d+\.\d+\.\d+\.?\s', text_start):
+            numbering_patterns_counts["decimal_multi_level"] += 1
+        elif re.match(r'^\d+\.\s', text_start):
+            numbering_patterns_counts["decimal_single_level"] += 1
+        elif re.match(r'^[A-Z]\.\s', text_start):
+            numbering_patterns_counts["alpha_upper"] += 1
+        elif re.match(r'^[IVX]+\.\s', text_start):
+            numbering_patterns_counts["roman_upper"] += 1
+            
+    doc_context["detected_heading_prefixes"] = [p for p, count in detected_prefixes.items() if count > 0]
+    doc_context["dominant_numbering_pattern"] = max(numbering_patterns_counts, key=numbering_patterns_counts.get) if any(numbering_patterns_counts.values()) else "none"
+    
+    # Unstructured Category Distribution
+    category_counts = {}
+    for d in meaningful_chunks:
+        category = d.metadata.get("category", "Unknown")
+        category_counts[category] = category_counts.get(category, 0) + 1
+    doc_context["category_distribution"] = category_counts
+
+    # --- 3. Document Type Inference (Heuristic-based) ---
+    inferred_type = "unknown"
+    
+    # Heuristics for technical/academic reports
+    if (doc_context["prevalence_starts_with_numbering"] > 0.15 or doc_context["category_distribution"].get("Header", 0) > 5) and \
+       (doc_context["category_distribution"].get("Table", 0) > 0 or doc_context["category_distribution"].get("FigureCaption", 0) > 0):
+        inferred_type = "technical_report"
+    # Heuristics for narrative documents (e.g., books)
+    elif doc_context["prevalence_ends_with_punctuation"] > 0.7 and doc_context["mean_element_length"] > 300 and \
+         doc_context["category_distribution"].get("NarrativeText", 0) > doc_context["category_distribution"].get("Title", 0) * 5:
+        inferred_type = "narrative_document"
+    # Heuristics for presentations (e.g., slides)
+    elif doc_context["category_distribution"].get("Title", 0) + doc_context["category_distribution"].get("Header", 0) > len(meaningful_chunks) / 5 and \
+         doc_context["mean_element_length"] < 200:
+        inferred_type = "presentation_slides"
+    # Heuristics for legal documents (more specific keywords)
+    elif any(p in doc_context["detected_heading_prefixes"] for p in ["Article", "Clause"]) or \
+         (doc_context["prevalence_all_caps_lines"] > 0.1 and doc_context["prevalence_starts_with_numbering"] > 0.05):
+        inferred_type = "legal_document"
+    
+    doc_context["inferred_document_type"] = inferred_type
+    
+    logger.debug(f"Document context generated: {doc_context}")
+    return doc_context
+
+# -------- Universal Heading Detection & Hierarchy Extraction --------
+def _extract_document_outline(
+    meaningful_chunks: list[Document],
+    doc_context: dict,
+    heading_detection_confidence_threshold: float,
+    min_chunks_per_section_for_merge: int,
+    logger: logging.Logger
+) -> list[dict]:
+    """
+    Extracts a hierarchical outline of the document by identifying headings and their levels.
+    This forms Layer 2 of the intelligent chunking.
+    """
+    document_outline = []
+    
+    if not meaningful_chunks:
+        logger.warning("No meaningful chunks provided for outline extraction. Returning empty outline.")
+        return document_outline
+
+    # Constants for scoring (can be tuned)
+    WEIGHT_CATEGORY_MATCH = 0.4
+    WEIGHT_LENGTH_PROFILE = 0.2
+    WEIGHT_FORMATTING = 0.2
+    WEIGHT_NUMBERING_PREFIX = 0.15
+    WEIGHT_POSITIONAL = 0.05
+
+    # Adaptive threshold adjustment based on document type
+    adjusted_threshold = heading_detection_confidence_threshold
+    if doc_context.get("inferred_document_type") == "technical_report":
+        adjusted_threshold += 0.05 # Be slightly more stringent for formal docs
+    elif doc_context.get("inferred_document_type") == "narrative_document":
+        adjusted_threshold -= 0.05 # Be slightly more permissive for less formal docs
+    adjusted_threshold = max(0.0, min(1.0, adjusted_threshold)) # Clamp between 0 and 1
+
+    current_heading_stack = [] # Stores (level, section_id)
+
+    # Helper to finalize a section
+    def _finalize_section(current_section_start_idx, current_idx, current_heading_text, current_heading_level, current_confidence, current_parent_id, current_unstructured_category):
+        if current_section_start_idx is not None and current_idx >= current_section_start_idx:
+            document_outline.append({
+                "section_id": str(uuid.uuid4()),
+                "heading_level": current_heading_level,
+                "heading_text": current_heading_text,
+                "start_chunk_index": current_section_start_idx,
+                "end_chunk_index": current_idx,
+                "confidence": current_confidence,
+                "parent_section_id": current_parent_id,
+                "unstructured_category": current_unstructured_category
+            })
+            logger.debug(f"Finalized section: Level {current_heading_level}, Text: '{current_heading_text[:50]}...', Chunks: {current_section_start_idx}-{current_idx}")
+
+    current_section_start_idx = 0
+    current_heading_text = "Document Start"
+    current_heading_level = 0 # Root level
+    current_confidence = 1.0
+    current_parent_id = None
+    current_unstructured_category = "Document"
+
+    for i, chunk in enumerate(meaningful_chunks):
+        text = chunk.page_content.strip()
+        category = chunk.metadata.get("category")
+        
+        if not text:
+            continue
+
+        # Calculate heading confidence score for the current chunk
+        score = 0.0
+
+        # 1. Unstructured Category Match
+        if category in {"Title", "Header", "Subheader"}:
+            score += WEIGHT_CATEGORY_MATCH
+        elif category in {"ListItem", "Table", "FigureCaption", "Formula"}: # These are important but not primary headings
+            score += WEIGHT_CATEGORY_MATCH * 0.5
+
+        # 2. Length Profile Match (adaptive)
+        if doc_context["short_element_threshold"] and len(text) <= doc_context["short_element_threshold"]:
+            score += WEIGHT_LENGTH_PROFILE * (1 - (len(text) / doc_context["short_element_threshold"])) # Shorter means higher score
+        elif doc_context["mean_element_length"] and len(text) < doc_context["mean_element_length"] / 2: # Also consider significantly shorter than mean
+             score += WEIGHT_LENGTH_PROFILE * 0.5
+
+        # 3. Line-Level Formatting
+        first_line = text.splitlines()[0].strip()
+        if first_line:
+            if first_line.isupper() and len(first_line) > 5: # All caps, not too short
+                score += WEIGHT_FORMATTING * doc_context["prevalence_all_caps_lines"]
+            if first_line.istitle():
+                score += WEIGHT_FORMATTING * doc_context["prevalence_title_case_lines"]
+            if first_line[-1] not in ".!?" and len(first_line) > 10: # Doesn't end with sentence punctuation
+                score += WEIGHT_FORMATTING * 0.5 # Fixed boost for non-sentence endings
+
+        # 4. Numbering/Prefix Match
+        if doc_context["prevalence_starts_with_numbering"] > 0.05 and re.match(r'^(\d+\.?|\d+\.\d+\.?|[A-Z]\.?|[IVX]+\.)\s', first_line):
+            score += WEIGHT_NUMBERING_PREFIX
+        elif any(first_line.lower().startswith(p.lower()) for p in doc_context["detected_heading_prefixes"]):
+            score += WEIGHT_NUMBERING_PREFIX * 0.75
+
+        if i > 0 and not meaningful_chunks[i-1].page_content.strip():
+             score += WEIGHT_POSITIONAL * 0.5
+
+        # Normalize score to 0-1 range (simple sum might exceed 1)
+        heading_score = min(1.0, score / (WEIGHT_CATEGORY_MATCH + WEIGHT_LENGTH_PROFILE + WEIGHT_FORMATTING + WEIGHT_NUMBERING_PREFIX + WEIGHT_POSITIONAL))
+
+        is_heading = heading_score >= adjusted_threshold
+        logger.debug(f"Chunk {i}: '{text[:50]}...' Category: {category}, Score: {heading_score:.2f}, Is Heading: {is_heading}")
+
+        if is_heading:
+            # Finalize the previous section
+            if i > current_section_start_idx: # Only finalize if current section has content
+                _finalize_section(current_section_start_idx, i - 1, current_heading_text, current_heading_level, current_confidence, current_parent_id, current_unstructured_category)
+            
+            # Infer new heading level
+            new_level = 1 # Default to level 1
+            if re.match(r'^\d+\.\d+\.\d+\.?\s', first_line): new_level = 3
+            elif re.match(r'^\d+\.\d+\.?\s', first_line): new_level = 2
+            elif re.match(r'^\d+\.\s', first_line): new_level = 1
+            elif re.match(r'^[A-Z]\.\s', first_line): new_level = 1 # A. Introduction
+            elif category == "Subheader": new_level = (current_heading_level + 1) if current_heading_level < 6 else 6
+            elif category == "Header": new_level = (current_heading_level + 1) if current_heading_level < 6 else 6
+            elif category == "Title": new_level = 1 # Major title
+
+            # Hierarchy enforcement: don't jump levels too much
+            if current_heading_stack:
+                last_level, _ = current_heading_stack[-1]
+                if new_level > last_level + 1: # Cannot jump from L1 to L3 directly, make it L2
+                    new_level = last_level + 1
+                elif new_level < last_level: # Going up the hierarchy
+                    while current_heading_stack and current_heading_stack[-1][0] >= new_level:
+                        current_heading_stack.pop()
+            
+            # Update current section details
+            current_section_start_idx = i
+            current_heading_text = first_line
+            current_heading_level = new_level
+            current_confidence = heading_score
+            current_parent_id = current_heading_stack[-1][1] if current_heading_stack else None
+            current_unstructured_category = category
+
+            # Update heading stack
+            current_heading_stack.append((new_level, document_outline[-1]["section_id"] if document_outline else None))
+            # If stack is empty, this is the first top-level heading, its parent is None.
+            # If document_outline is empty, it means this is the very first section.
+
+    # Finalize the last section after the loop
+    _finalize_section(current_section_start_idx, len(meaningful_chunks) - 1, current_heading_text, current_heading_level, current_confidence, current_parent_id, current_unstructured_category)
+
+    # --- Robust Fallback Strategies (if primary detection failed or was too sparse) ---
+    if not document_outline or len(document_outline) < 2: # If less than 2 sections detected, or none
+        logger.info("Primary heading detection yielded sparse results. Applying fallback strategies.")
+        document_outline = [] # Reset outline
+
+        # Fallback 1: Blank Line Sectioning
+        if doc_context.get("avg_blank_lines_between_sections", 0) >= 1.5: # If blank lines are somewhat common
+            current_fallback_section_start_idx = 0
+            fallback_section_counter = 1
+            for i in range(1, len(meaningful_chunks)):
+                # Heuristic: if a significant break (e.g., 2+ lines) or a very short chunk followed by a long one
+                if not meaningful_chunks[i-1].page_content.strip() and not meaningful_chunks[i].page_content.strip(): # Two consecutive empty lines
+                    if i > current_fallback_section_start_idx:
+                        document_outline.append({
+                            "section_id": str(uuid.uuid4()),
+                            "heading_level": 1,
+                            "heading_text": f"Content Block {fallback_section_counter}",
+                            "start_chunk_index": current_fallback_section_start_idx,
+                            "end_chunk_index": i - 1,
+                            "confidence": 0.4, # Lower confidence
+                            "parent_section_id": None,
+                            "unstructured_category": "FallbackSection"
+                        })
+                        fallback_section_counter += 1
+                        current_fallback_section_start_idx = i
+            # Add last fallback section
+            if len(meaningful_chunks) > current_fallback_section_start_idx:
+                 document_outline.append({
+                    "section_id": str(uuid.uuid4()),
+                    "heading_level": 1,
+                    "heading_text": f"Content Block {fallback_section_counter}",
+                    "start_chunk_index": current_fallback_section_start_idx,
+                    "end_chunk_index": len(meaningful_chunks) - 1,
+                    "confidence": 0.4,
+                    "parent_section_id": None,
+                    "unstructured_category": "FallbackSection"
+                })
+        
+        # Fallback 2: Paragraph Grouping (if no sections yet or still too few)
+        if not document_outline or len(document_outline) < 2:
+            document_outline = [] # Reset again
+            fallback_section_counter = 1
+            chunks_per_group = 5 # Group into blocks of 5 meaningful chunks
+            for i in range(0, len(meaningful_chunks), chunks_per_group):
+                document_outline.append({
+                    "section_id": str(uuid.uuid4()),
+                    "heading_level": 1,
+                    "heading_text": f"Content Block {fallback_section_counter}",
+                    "start_chunk_index": i,
+                    "end_chunk_index": min(i + chunks_per_group - 1, len(meaningful_chunks) - 1),
+                    "confidence": 0.3, # Even lower confidence
+                    "parent_section_id": None,
+                    "unstructured_category": "FallbackParagraphGroup"
+                })
+                fallback_section_counter += 1
+
+    # --- Post-processing: Merge very small sections ---
+    # This loop might need to run multiple times if merges create new small sections
+    merged_count = 0
+    while True:
+        initial_outline_len = len(document_outline)
+        new_outline = []
+        i = 0
+        while i < len(document_outline):
+            current_section = document_outline[i]
+            section_content_length = current_section["end_chunk_index"] - current_section["start_chunk_index"] + 1
+            
+            # Only merge if it's a content section (level > 0) and has too few content elements
+            if current_section["heading_level"] > 0 and section_content_length < min_chunks_per_section_for_merge:
+                logger.debug(f"Merging small section: '{current_section['heading_text'][:50]}...' (len: {section_content_length})")
+                merged_count += 1
+                # Try to merge with previous section if available and same level or previous is parent
+                if new_outline and new_outline[-1]["heading_level"] >= current_section["heading_level"]:
+                    new_outline[-1]["end_chunk_index"] = current_section["end_chunk_index"]
+                    # Optionally, update heading text to reflect combined content
+                    new_outline[-1]["heading_text"] += f" / {current_section['heading_text']}"
+                    new_outline[-1]["confidence"] = min(new_outline[-1]["confidence"], current_section["confidence"]) # Take lower confidence
+                # Else, merge with next section
+                elif i + 1 < len(document_outline):
+                    next_section = document_outline[i+1]
+                    next_section["start_chunk_index"] = current_section["start_chunk_index"]
+                    next_section["heading_text"] = f"{current_section['heading_text']} / {next_section['heading_text']}"
+                    next_section["confidence"] = min(next_section["confidence"], current_section["confidence"])
+                    new_outline.append(next_section) # Add the modified next section
+                    i += 1 # Skip next section as it's merged
+                else: # Cannot merge, keep as is (should be rare with good min_chunks_per_section_for_merge)
+                    new_outline.append(current_section)
+            else:
+                new_outline.append(current_section)
+            i += 1
+        
+        document_outline = new_outline
+        if len(document_outline) == initial_outline_len: # No more merges happened
+            break
+    
+    logger.info(f"Post-processing merged {merged_count} small sections.")
+    logger.debug(f"Final document outline: {document_outline}")
+    return document_outline
+
+# -------- Adaptive Hierarchical Semantic Chunking --------
+def _generate_semantic_chunks(
+    meaningful_chunks: list[Document],
+    document_outline: list[dict],
+    user_chunk_size: int,
+    user_chunk_overlap: int,
+    pinecone_metadata_max_bytes: int,
+    parsed_global_custom_metadata: dict,
+    document_specific_metadata_map: dict,
+    document_id: str,
+    file_name: str,
+    sentence_split_threshold_chars: int,
+    logger: logging.Logger
+) -> list[Document]:
+    """
+    Generates final, semantically coherent, and context-rich chunks based on the document outline.
+    This forms Layer 3 of the intelligent chunking.
+    """
+    final_semantic_chunks = []
+    
+    # Constants for internal re-chunking (from original code, now centralized)
+    MIN_RE_SPLIT_CHUNK_SIZE = 100
+    MAX_UTF8_BYTES_PER_CHAR = 4
+    SAFETY_BUFFER_BYTES = 1024
+
+    # Helper for internal re-splitting if metadata payload is too large
+    def _resplit_chunk_for_pinecone_limit(text_content, original_metadata, current_logger):
+        non_text_metadata_bytes = len(json.dumps({k: v for k, v in original_metadata.items() if k != "text"}).encode("utf-8"))
+        remaining_space_for_text = pinecone_metadata_max_bytes - non_text_metadata_bytes - SAFETY_BUFFER_BYTES
+        remaining_space_for_text = max(0, remaining_space_for_text)
+        new_re_split_chunk_size_chars = max(MIN_RE_SPLIT_CHUNK_SIZE, remaining_space_for_text // MAX_UTF8_BYTES_PER_CHAR)
+
+        current_logger.warning(f"Chunk too large for Pinecone metadata. Re-splitting with max_chars={new_re_split_chunk_size_chars}.")
+        
+        # Use a simple character splitter for this emergency re-split
+        emergency_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=new_re_split_chunk_size_chars,
+            chunk_overlap=0,
+            length_function=len,
+            add_start_index=True
+        )
+        temp_doc_for_resplit = Document(page_content=text_content, metadata=original_metadata)
+        sub_chunks = emergency_splitter.split_documents([temp_doc_for_resplit])
+        
+        resplit_docs = []
+        for sc in sub_chunks:
+            # Ensure original metadata is carried over and text is updated
+            new_meta = original_metadata.copy()
+            new_meta["text"] = sc.page_content # Update text field
+            resplit_docs.append(Document(page_content=sc.page_content, metadata=new_meta))
+        return resplit_docs
+
+    # Iterate through each section identified in the outline
+    for section_dict in document_outline:
+        section_id = section_dict["section_id"]
+        heading_level = section_dict["heading_level"]
+        heading_text = section_dict["heading_text"]
+        start_idx = section_dict["start_chunk_index"]
+        end_idx = section_dict["end_chunk_index"]
+        confidence = section_dict["confidence"]
+        
+        # Determine the content elements for this specific section
+        content_elements_for_section = meaningful_chunks[start_idx : end_idx + 1]
+
+        # Construct section prefix (e.g., markdown heading)
+        section_prefix = f"#{'#' * min(heading_level, 6)} {heading_text}\n\n"
+        
+        current_chunk_content_elements = []
+        current_chunk_raw_text_length = 0 # Length of text content, excluding prefix
+        
+        section_chunks_temp = [] # Chunks generated for this section before final metadata/ID assignment
+
+        # Adaptive splitting strategy within the section
+        for i, element in enumerate(content_elements_for_section):
+            element_text = element.page_content
+            element_length = len(element_text)
+
+            # Heuristic for when to finalize a chunk
+            # If adding the current element would significantly exceed user_chunk_size,
+            # or if it's a critical element that should start a new logical chunk (e.g., a table after text)
+            should_finalize_current_chunk = False
+            if current_chunk_raw_text_length + element_length > user_chunk_size:
+                should_finalize_current_chunk = True
+            elif element.metadata.get("category") in {"Table", "FigureCaption", "Formula"} and current_chunk_raw_text_length > 0:
+                # If current element is a critical concise content type and we already have some content,
+                # it's often better to start a new chunk with it to ensure its context is primary.
+                should_finalize_current_chunk = True
+
+            if should_finalize_current_chunk and current_chunk_content_elements:
+                # Finalize the current chunk
+                combined_text = "\n\n".join([e.page_content for e in current_chunk_content_elements])
+                section_chunks_temp.append(Document(page_content=combined_text, metadata=current_chunk_content_elements[0].metadata.copy())) # Use first element's metadata as base
+                current_chunk_content_elements = []
+                current_chunk_raw_text_length = 0
+
+            # Handle very long individual elements in medium/low confidence sections
+            if element_length > sentence_split_threshold_chars and confidence < 0.75: # Only split long elements in less confident sections
+                logger.debug(f"Splitting long element ({element_length} chars) into sentences for section '{heading_text}'.")
+                # Use NLTK for sentence tokenization
+                sentences = nltk.sent_tokenize(element_text)
+                current_sentence_chunk = []
+                current_sentence_chunk_len = 0
+                for sent in sentences:
+                    if current_sentence_chunk_len + len(sent) > user_chunk_size and current_sentence_chunk:
+                        combined_sent_text = " ".join(current_sentence_chunk)
+                        section_chunks_temp.append(Document(page_content=combined_sent_text, metadata=element.metadata.copy()))
+                        current_sentence_chunk = [sent]
+                        current_sentence_chunk_len = len(sent)
+                    else:
+                        current_sentence_chunk.append(sent)
+                        current_sentence_chunk_len += len(sent)
+                if current_sentence_chunk:
+                    combined_sent_text = " ".join(current_sentence_chunk)
+                    section_chunks_temp.append(Document(page_content=combined_sent_text, metadata=element.metadata.copy()))
+            else:
+                current_chunk_content_elements.append(element)
+                current_chunk_raw_text_length += element_length
+
+        # Finalize any remaining elements in the current_chunk_content_elements
+        if current_chunk_content_elements:
+            combined_text = "\n\n".join([e.page_content for e in current_chunk_content_elements])
+            section_chunks_temp.append(Document(page_content=combined_text, metadata=current_chunk_content_elements[0].metadata.copy()))
+
+        # Apply intelligent overlap and minimum length enforcement for section_chunks_temp
+        # This is a simplified version; a full implementation would involve more complex merging/splitting
+        # at semantic boundaries (sentence/paragraph) for overlap and min_length.
+        # For now, we ensure the section prefix is added and metadata is enriched.
+        
+        final_section_chunks = []
+        for j, temp_chunk in enumerate(section_chunks_temp):
+            final_content = section_prefix + temp_chunk.page_content
+            base_metadata = temp_chunk.metadata.copy()
+            allowed_base_keys = {
+                "page_number", "page", "category", "filetype", "languages", "last_modified"
+            }
+
+            # Start with a copy of the base metadata from Unstructured
+            initial_chunk_metadata = temp_chunk.metadata.copy()
+
+            # Pass the initial metadata, global custom metadata, and document-specific custom metadata
+            sanitized_meta = _canonicalize_and_filter_metadata(
+                initial_chunk_metadata,
+                parsed_global_custom_metadata,
+                document_specific_metadata_map.get(file_name, {}), # Pass doc-specific for this file
+                logger
+            )
+
+            sanitized_meta["document_id"] = document_id
+            sanitized_meta["file_name"] = file_name # Ensure canonical file_name
+            sanitized_meta["section_id"] = section_id
+            sanitized_meta["section_heading"] = heading_text
+            sanitized_meta["heading_level"] = heading_level
+            sanitized_meta["chunk_confidence"] = float(confidence)
+            sanitized_meta["chunk_index_in_section"] = j
+            sanitized_meta["total_chunks_in_section"] = len(section_chunks_temp)
+            sanitized_meta["text"] = final_content
+
+            chunk_id = deterministic_chunk_id(
+                document_id,
+                final_content,
+                sanitized_meta.get("page_number", sanitized_meta.get("page", "")), # Use page_number from sanitized
+                sanitized_meta.get("start_index", "") # Use start_index from sanitized
+            )
+            sanitized_meta["chunk_id"] = chunk_id
+
+            pruned_meta = _shrink_metadata_to_limit(sanitized_meta, logger, pinecone_metadata_max_bytes)
+            
+            # Check if text was truncated during shrinking
+            if pruned_meta.get("text_truncated", False):
+                logger.warning(f"Chunk '{chunk_id}' text was truncated to fit Pinecone metadata limit.")
+                # If text was truncated, the page_content should reflect the truncated text
+                # This ensures the embedding is generated from the actual text stored in Pinecone
+                final_content = pruned_meta["text"]
+
+            final_section_chunks.append(Document(page_content=final_content, metadata=pruned_meta))
+        
+        final_semantic_chunks.extend(final_section_chunks)
+
+    logger.info(f"Generated {len(final_semantic_chunks)} final semantic chunks for document '{file_name}'.")
+    return final_semantic_chunks
 
 # -------- API Connection Test Function --------
 def test_api_connections(pinecone_api_key: str, embedding_api_key: str, logger: logging.Logger):
@@ -856,6 +1656,44 @@ def main():
             key="config_overwrite_checkbox"
         )
 
+        with st.expander("⚙️ Advanced Chunking Settings", expanded=False):
+            heading_detection_confidence_threshold_ui = st.slider(
+                "Heading Detection Confidence Threshold",
+                min_value=0.0,
+                max_value=1.0,
+                value=float(os.environ.get("HEADING_DETECTION_CONFIDENCE_THRESHOLD", DEFAULT_SETTINGS["HEADING_DETECTION_CONFIDENCE_THRESHOLD"])),
+                step=0.01,
+                format="%.2f",
+                help=(
+                    "Minimum confidence score for a text segment to be classified as a heading by Layer 2. "
+                    "Higher values are more strict, lower values are more permissive. Default: 0.65."
+                ),
+                key="config_heading_detection_confidence_threshold"
+            )
+
+            min_chunks_per_section_for_merge_ui = st.number_input(
+                "Min Content Elements Per Section (for merging)",
+                min_value=1,
+                value=int(os.environ.get("MIN_CHUNKS_PER_SECTION_FOR_MERGE", DEFAULT_SETTINGS["MIN_CHUNKS_PER_SECTION_FOR_MERGE"])),
+                step=1,
+                help=(
+                    "Minimum number of meaningful content elements (paragraphs, list items, etc.) a section must contain "
+                    "after its heading. Sections with fewer elements will be merged with neighbors during Layer 2 post-processing. Default: 2."
+                ),
+                key="config_min_chunks_per_section_for_merge"
+            )
+
+            sentence_split_threshold_chars_ui = st.number_input(
+                "Sentence Split Threshold (characters)",
+                min_value=100,
+                value=int(os.environ.get("SENTENCE_SPLIT_THRESHOLD_CHARS", DEFAULT_SETTINGS["SENTENCE_SPLIT_THRESHOLD_CHARS"])),
+                step=50,
+                help=(
+                    "For sections with medium/low confidence structure, if an individual content element (e.g., a long paragraph) "
+                    "exceeds this character length, it may be further split into sentences to manage chunk size. Default: 300."
+                ),
+                key="config_sentence_split_threshold_chars"
+            )
         # Advanced Logging Settings
         with st.expander("Advanced Logging Settings", expanded=False):
             logging_level_options = ["DEBUG", "INFO", "WARNING", "ERROR"]
@@ -905,6 +1743,9 @@ def main():
             "MIN_GENERIC_CONTENT_LENGTH": str(min_generic_content_length_ui),
             "ENABLE_NER_FILTERING": str(enable_ner_filtering),
             "UNSTRUCTURED_STRATEGY": unstructured_strategy,
+            "HEADING_DETECTION_CONFIDENCE_THRESHOLD": str(heading_detection_confidence_threshold_ui),
+            "MIN_CHUNKS_PER_SECTION_FOR_MERGE": str(min_chunks_per_section_for_merge_ui),
+            "SENTENCE_SPLIT_THRESHOLD_CHARS": str(sentence_split_threshold_chars_ui),
         }
         with open(".env", "w") as f:
             for k, v in to_save.items():
@@ -931,6 +1772,9 @@ def main():
 
             st.session_state.dynamic_metadata_fields = [{"key": "", "value": ""}]
             defaults["CUSTOM_METADATA"] = json.dumps(st.session_state.dynamic_metadata_fields)
+            defaults["HEADING_DETECTION_CONFIDENCE_THRESHOLD"] = DEFAULT_SETTINGS["HEADING_DETECTION_CONFIDENCE_THRESHOLD"]
+            defaults["MIN_CHUNKS_PER_SECTION_FOR_MERGE"] = DEFAULT_SETTINGS["MIN_CHUNKS_PER_SECTION_FOR_MERGE"]
+            defaults["SENTENCE_SPLIT_THRESHOLD_CHARS"] = DEFAULT_SETTINGS["SENTENCE_SPLIT_THRESHOLD_CHARS"]
 
             with open(".env", "w") as f:
                 for k, v in defaults.items():
@@ -963,7 +1807,7 @@ def main():
             field['value'] = st.text_input(f"Value {i+1}", value=field['value'], key=f"meta_value_{i}", label_visibility="collapsed")
         with cols[2]:
             if len(st.session_state.dynamic_metadata_fields) > 1 or (len(st.session_state.dynamic_metadata_fields) == 1 and i == 0 and (field['key'] != "" or field['value'] != "")):
-                if st.button("🗑️", key=f"remove_meta_{i}", help="Remove this custom field"):
+                if st.button("ðŸ—‘ï¸", key=f"remove_meta_{i}", help="Remove this custom field"):
                     st.session_state.dynamic_metadata_fields.pop(i)
                     st.rerun()
             else:
@@ -1220,7 +2064,7 @@ def main():
                             if text:
                                 if any(keyword in text.lower() for keyword in whitelisted_keywords_set):
                                     keep = True
-                                elif category in IMPORTANT_UNSTRUCTURED_CATEGORIES:
+                                elif category in STRUCTURAL_CUES_AND_CRITICAL_CONCISE_CONTENT:
                                     keep = True
                                 elif len(text) >= min_generic_content_length_ui:
                                     keep = True
@@ -1247,129 +2091,41 @@ def main():
                         status_container.update(label=f"Document: **{file_name}** - No meaningful content!", state="warning", expanded=False)
                         continue
 
-                    status_container.update(label=f"Processing document: **{file_name}** - Preparing for chunking...", state="running")
-                    # Dynamic chunking logic to ensure Pinecone metadata byte limit is respected
-                    file_names_for_overhead_estimation = [f[0].name for f in files_to_process_plan]
-                    base_metadata_overhead_bytes = get_estimated_base_metadata_overhead(
-                        parsed_global_custom_metadata,
-                        document_specific_metadata_map,
-                        file_names_for_overhead_estimation,
+                    # Layer 1: Adaptive Document Structure Analysis
+                    status_container.update(label=f"Processing document: **{file_name}** - Analyzing document structure (Layer 1)...", state="running")
+                    doc_context = _analyze_document_structure(meaningful_chunks, logger)
+                    status_container.write(f"✅ Layer 1: Document structure analyzed. Inferred type: '{doc_context.get('inferred_document_type', 'N/A')}'.")
+                    logger.info(f"'{file_name}': Document structure analysis complete. Context: {doc_context}")
+
+                    # Layer 2: Universal Heading Detection & Hierarchy Extraction
+                    status_container.update(label=f"Processing document: **{file_name}** - Extracting document outline (Layer 2)...", state="running")
+                    document_outline = _extract_document_outline(
+                        meaningful_chunks,
+                        doc_context,
+                        heading_detection_confidence_threshold_ui, # Pass new UI param
+                        min_chunks_per_section_for_merge_ui,      # Pass new UI param
                         logger
                     )
-                    logger.info(f"Estimated base metadata overhead: {base_metadata_overhead_bytes} bytes.")
+                    status_container.write(f"✅ Layer 2: Document outline extracted. Detected {len(document_outline)} sections.")
+                    logger.info(f"'{file_name}': Document outline extracted. Outline: {document_outline}")
 
-                    MAX_TEXT_BYTES_PER_CHUNK_PINE = PINECONE_METADATA_MAX_BYTES - base_metadata_overhead_bytes - SAFETY_BUFFER_BYTES
-                    MAX_SAFE_CHARS_FOR_SPLITTER_PINE = max(MIN_RE_SPLIT_CHUNK_SIZE, MAX_TEXT_BYTES_PER_CHUNK_PINE // MAX_UTF8_BYTES_PER_CHAR)
-                    logger.info(f"Calculated MAX_TEXT_BYTES_PER_CHUNK (Pinecone): {MAX_TEXT_BYTES_PER_CHUNK_PINE} bytes.")
-                    logger.info(f"Calculated MAX_SAFE_CHARS_FOR_SPLITTER (Pinecone): {MAX_SAFE_CHARS_FOR_SPLITTER_PINE} characters.")
-
-                    initial_splitter_chunk_size = min(chunk_size, MAX_SAFE_CHARS_FOR_SPLITTER_PINE)
-
-                    if chunk_size > initial_splitter_chunk_size:
-                        status_container.write(
-                            f"⚠️ Requested chunk size of {chunk_size} chars was too large. "
-                            f"Adjusted to {initial_splitter_chunk_size} chars for initial split due to Pinecone's metadata limit."
-                        )
-                        logger.warning(f"User chunk_size {chunk_size} adjusted to {initial_splitter_chunk_size} for initial split due to Pinecone's metadata byte limit.")
-                    else:
-                        status_container.write(f"Using chunk size {chunk_size} for initial split.")
-                        logger.info(f"Using user-defined chunk size {chunk_size} for initial split.")
-
-                    splitter = RecursiveCharacterTextSplitter(
-                        chunk_size=initial_splitter_chunk_size,
-                        chunk_overlap=chunk_overlap,
-                        length_function=len,
-                        add_start_index=True
+                    # Layer 3: Adaptive Hierarchical Semantic Chunking
+                    status_container.update(label=f"Processing document: **{file_name}** - Generating semantic chunks (Layer 3)...", state="running")
+                    file_specific_final_chunks = _generate_semantic_chunks(
+                        meaningful_chunks=meaningful_chunks,
+                        document_outline=document_outline,
+                        user_chunk_size=chunk_size, # User-defined chunk size
+                        user_chunk_overlap=chunk_overlap, # User-defined chunk overlap
+                        pinecone_metadata_max_bytes=PINECONE_METADATA_MAX_BYTES,
+                        parsed_global_custom_metadata=parsed_global_custom_metadata,
+                        document_specific_metadata_map=document_specific_metadata_map,
+                        document_id=document_id,
+                        file_name=file_name,
+                        sentence_split_threshold_chars=sentence_split_threshold_chars_ui, # Pass new UI param
+                        logger=logger
                     )
-                    initial_chunks = splitter.split_documents(meaningful_chunks)
-                    status_container.write(f"Initially split into {len(initial_chunks)} chunks.")
-                    logger.info(f"Document '{file_name}' initially split into {len(initial_chunks)} chunks.")
-
-                    # Post-split validation and dynamic re-chunking loop for Pinecone byte limit
-                    file_specific_final_chunks = []
-                    re_chunked_byte_count = 0
-
-                    status_container.update(label=f"Processing document: **{file_name}** - Validating chunks...", state="running")
-                    for i, chunk in enumerate(initial_chunks):
-                        provisional_metadata = {}
-
-                        for key, value in parsed_global_custom_metadata.items():
-                            if key not in RESERVED_METADATA_KEYS:
-                                provisional_metadata[key] = value
-
-                        current_file_name_in_chunk = chunk.metadata.get("file_name")
-                        if current_file_name_in_chunk and current_file_name_in_chunk in document_specific_metadata_map:
-                            doc_specific_md = document_specific_metadata_map[current_file_name_in_chunk]
-                            for k, v in doc_specific_md.items():
-                                if k not in RESERVED_METADATA_KEYS:
-                                    provisional_metadata[k] = v
-
-                        page_num = chunk.metadata.get("page_number", chunk.metadata.get("page", ""))
-                        start_idx = chunk.metadata.get("start_index", "")
-
-                        provisional_metadata["document_id"] = document_id
-                        provisional_metadata["file_name"] = current_file_name_in_chunk if current_file_name_in_chunk else ""
-                        provisional_metadata["page_number"] = page_num if page_num else ""
-                        provisional_metadata["start_index"] = start_idx if start_idx else ""
-                        if "category" in chunk.metadata:
-                            provisional_metadata["category"] = chunk.metadata["category"]
-                        if "original_file_path" in chunk.metadata:
-                            provisional_metadata["original_file_path"] = chunk.metadata["original_file_path"]
-
-                        provisional_metadata["text"] = chunk.page_content
-
-                        cleaned_provisional_metadata = {}
-                        for k, v in provisional_metadata.items():
-                            if isinstance(v, (str, int, float, bool, list, dict)):
-                                cleaned_provisional_metadata[k] = v
-                            else:
-                                cleaned_provisional_metadata[k] = str(v)
-
-                        provisional_metadata_bytes = len(json.dumps(cleaned_provisional_metadata).encode("utf-8"))
-
-                        if provisional_metadata_bytes > PINECONE_METADATA_MAX_BYTES:
-                            re_chunked_byte_count += 1
-                            logger.warning(
-                                f"Chunk {i+1} from '{file_name}' (page {page_num}) "
-                                f"is too large for Pinecone metadata ({provisional_metadata_bytes} bytes). "
-                                f"Dynamically re-chunking this piece."
-                            )
-                            status_container.write(
-                                f"⚠️ Re-chunking part of '{file_name}' (page {page_num}) to fit Pinecone's metadata limit."
-                            )
-
-                            non_text_metadata_bytes = provisional_metadata_bytes - len(chunk.page_content.encode("utf-8"))
-                            remaining_space_for_text = PINECONE_METADATA_MAX_BYTES - non_text_metadata_bytes - SAFETY_BUFFER_BYTES
-                            remaining_space_for_text = max(0, remaining_space_for_text)
-                            new_re_split_chunk_size_chars = max(MIN_RE_SPLIT_CHUNK_SIZE, remaining_space_for_text // MAX_UTF8_BYTES_PER_CHAR)
-
-                            logger.info(f"Re-splitting by bytes with new chunk_size: {new_re_split_chunk_size_chars} characters.")
-
-                            re_splitter_bytes = RecursiveCharacterTextSplitter(
-                                chunk_size=new_re_split_chunk_size_chars,
-                                chunk_overlap=0,
-                                length_function=len,
-                                add_start_index=True
-                            )
-                            temp_doc_for_resplit = Document(page_content=chunk.page_content, metadata=chunk.metadata)
-                            sub_chunks_byte_split = re_splitter_bytes.split_documents([temp_doc_for_resplit])
-
-                            for sub_chunk in sub_chunks_byte_split:
-                                sub_chunk.metadata.update(chunk.metadata)
-                                sub_chunk.metadata["original_file_path"] = chunk.metadata.get("original_file_path", "")
-                                file_specific_final_chunks.append(sub_chunk)
-                        else:
-                            file_specific_final_chunks.append(chunk)
-
-                    if re_chunked_byte_count > 0:
-                        status_container.write(f"Completed byte-based re-chunking. {re_chunked_byte_count} chunks were re-split.")
-                        logger.info(f"Completed byte-based re-chunking for '{file_name}'. {re_chunked_byte_count} chunks were re-split.")
-                    else:
-                        status_container.write("No chunks required byte-based re-chunking.")
-                        logger.info(f"No chunks required byte-based re-chunking for '{file_name}'.")
-
-                    status_container.write(f"Final chunks for '{file_name}': {len(file_specific_final_chunks)}.")
-                    logger.info(f"Final chunks for '{file_name}': {len(file_specific_final_chunks)}.")
+                    status_container.write(f"✅ Layer 3: Final semantic chunks generated: {len(file_specific_final_chunks)} chunks.")
+                    logger.info(f"'{file_name}': Generated {len(file_specific_final_chunks)} final semantic chunks.")
 
                     # Embedding and Upserting for the current file's chunks
                     status_container.update(label=f"Processing document: **{file_name}** - Generating embeddings...", state="running")
@@ -1412,49 +2168,33 @@ def main():
 
                     file_records = []
                     for c, vec in zip(file_specific_final_chunks, file_vectors):
-                        final_metadata = {}
+                        # The metadata 'c.metadata' should already be clean and pruned from Layer 3.
+                        # This loop acts as a final safeguard.
+                        
+                        # Ensure chunk_id is present (it should be from Layer 3)
+                        chunk_id = c.metadata.get("chunk_id")
+                        if not chunk_id:
+                            # Fallback if somehow chunk_id is missing (should not happen with Layer 3 changes)
+                            chunk_id = deterministic_chunk_id(document_id, c.page_content or "", c.metadata.get("page_number", ""), c.metadata.get("start_index", ""))
+                            logger.warning(f"Chunk ID missing from Layer 3 output. Generated fallback ID: {chunk_id}")
+                            c.metadata["chunk_id"] = chunk_id # Add to metadata for consistency
 
-                        for key, value in parsed_global_custom_metadata.items():
-                            if key not in RESERVED_METADATA_KEYS:
-                                final_metadata[key] = value
-                            else:
-                                logger.warning(f"Chunk {c.metadata.get('chunk_id', 'N/A')}: Ignored global custom metadata key '{key}' as it is reserved.")
+                        # Ensure 'text' field is present (it should be from Layer 3)
+                        if "text" not in c.metadata:
+                             c.metadata["text"] = c.page_content
+                             logger.warning(f"Metadata 'text' field missing for chunk '{chunk_id}'. Added from page_content.")
 
-                        current_file_name_in_chunk = c.metadata.get("file_name")
-                        if current_file_name_in_chunk and current_file_name_in_chunk in document_specific_metadata_map:
-                            doc_specific_md = document_specific_metadata_map[current_file_name_in_chunk]
-                            for k, v in doc_specific_md.items():
-                                if k not in RESERVED_METADATA_KEYS:
-                                    final_metadata[k] = v
-                                else:
-                                    logger.warning(f"Chunk {c.metadata.get('chunk_id', 'N/A')}: Ignored document-specific metadata key '{k}' as it is reserved.")
+                        # Final shrink check: This should ideally not trigger if Layer 3 worked correctly,
+                        # but it's a critical last line of defense against oversized metadata.
+                        final_metadata_for_upsert = _shrink_metadata_to_limit(c.metadata, logger, PINECONE_METADATA_MAX_BYTES)
+                        
+                        # If the text was truncated here, it means something went wrong earlier,
+                        # or the original chunk was already too large.
+                        if final_metadata_for_upsert.get("text_truncated", False):
+                            logger.critical(f"CRITICAL: Chunk '{chunk_id}' text was truncated AGAIN at upsert stage. This indicates a serious issue in prior metadata handling or chunk size.")
+                            status_container.write(f"❌ Critical: Chunk '{chunk_id}' text truncated at final upsert. Review logs.")
 
-                        page_num = c.metadata.get("page_number", c.metadata.get("page", ""))
-                        start_idx = c.metadata.get("start_index", "")
-
-                        chunk_id = deterministic_chunk_id(document_id, c.page_content or "", page_num, start_idx)
-
-                        final_metadata["document_id"] = document_id
-                        final_metadata["file_name"] = current_file_name_in_chunk if current_file_name_in_chunk else ""
-                        final_metadata["text"] = c.page_content
-                        if page_num: final_metadata["page_number"] = page_num
-                        if start_idx: final_metadata["start_index"] = start_idx
-                        if "category" in c.metadata: final_metadata["category"] = c.metadata["category"]
-                        if "original_file_path" in c.metadata: final_metadata["original_file_path"] = c.metadata["original_file_path"]
-
-                        cleaned_metadata = {}
-                        for k, v in final_metadata.items():
-                            if isinstance(v, (str, int, float, bool, list, dict)):
-                                cleaned_metadata[k] = v
-                            else:
-                                cleaned_metadata[k] = str(v)
-
-                        metadata_json_size = len(json.dumps(cleaned_metadata).encode("utf-8"))
-                        if metadata_json_size > PINECONE_METADATA_MAX_BYTES:
-                            logger.critical(f"CRITICAL ERROR: Metadata for chunk {chunk_id} STILL exceeds {PINECONE_METADATA_MAX_BYTES} bytes ({metadata_json_size} bytes) AFTER re-chunking. This should not happen with current logic. Data might be lost or upsert will fail.")
-                            status_container.write(f"❌ Critical Error: Chunk {chunk_id} metadata is still too large. Upsert might fail. Please review logs.")
-
-                        file_records.append((chunk_id, vec, cleaned_metadata))
+                        file_records.append((chunk_id, vec, final_metadata_for_upsert))
                     logger.info(f"Prepared {len(file_records)} records for upsert for '{file_name}'.")
 
                     status_container.update(label=f"Processing document: **{file_name}** - Upserting to Pinecone...", state="running")
