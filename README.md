@@ -1,6 +1,6 @@
 # Pinecone Ingestor
 
-[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)  
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/downloads/)  
 [![Streamlit](https://img.shields.io/badge/streamlit-v1.XX-green)](https://streamlit.io/)  
 [![Docker](https://img.shields.io/badge/docker-compatible-blue)](https://www.docker.com/)
 
