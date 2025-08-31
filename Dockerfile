@@ -1,5 +1,5 @@
 # ---- Build Stage ----
-FROM python:3.10-slim-bookworm AS builder
+FROM python:3.11-slim-bookworm AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /app
@@ -32,7 +32,7 @@ RUN poetry install --only main --no-root --no-interaction
 
 
 # ---- Production Stage ----
-FROM python:3.10-slim-bookworm AS production
+FROM python:3.11-slim-bookworm AS production
 
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /app
@@ -56,7 +56,7 @@ COPY pyproject.toml poetry.lock ./
 # Configure Poetry to use the copied virtual environment
 RUN pip install "poetry==2.1.4" && \
     poetry config virtualenvs.create false && \
-    poetry env use python3.10
+    poetry env use python3.11
 
 # Download SpaCy model directly in production for robustness
 RUN poetry run python -m spacy download en_core_web_sm
