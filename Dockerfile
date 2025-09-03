@@ -1,5 +1,5 @@
 # ---- Build Stage ----
-FROM python:3.11-slim-bookworm AS builder
+FROM python:3.13-slim-bookworm AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /app
@@ -19,47 +19,43 @@ RUN apt-get update && \
         tesseract-ocr-eng \
         libreoffice \
         pandoc \
-        libgl1-mesa-glx && \
+        libgl1-mesa-glx \
     rm -rf /var/lib/apt/lists/*
 
 RUN pip install "poetry==2.1.4"
+ENV POETRY_VIRTUALENVS_PATH=/app/.venv
 
-# Copy project definition files for dependency resolution
 COPY pyproject.toml poetry.lock ./
 
 # Install Python dependencies into Poetry's virtual environment
 RUN poetry install --only main --no-root --no-interaction
 
+RUN ls -l /app/.venv/bin/python
+
 
 # ---- Production Stage ----
-FROM python:3.11-slim-bookworm AS production
+FROM python:3.13-slim-bookworm AS production
 
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /app
 
+COPY --from=builder /app/.venv /app/.venv
+ENV PATH="/app/.venv/bin:$PATH"
+
 # Install runtime system dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        libmagic-dev \
+        libmagic1 \
         poppler-utils \
         tesseract-ocr \
         tesseract-ocr-eng \
         libreoffice \
         pandoc \
-        libgl1-mesa-glx && \
+        libgl1-mesa-glx \
     rm -rf /var/lib/apt/lists/*
 
-# Copy Python dependencies from builder stage
-COPY --from=builder /root/.cache/pypoetry/virtualenvs /root/.cache/pypoetry/virtualenvs
-COPY pyproject.toml poetry.lock ./
-
-# Configure Poetry to use the copied virtual environment
-RUN pip install "poetry==2.1.4" && \
-    poetry config virtualenvs.create false && \
-    poetry env use python3.11
-
 # Download SpaCy model directly in production for robustness
-RUN poetry run python -m spacy download en_core_web_sm
+RUN python -m spacy download en_core_web_sm
 
 # Copy application code and run script
 COPY app.py run.sh ./
@@ -68,4 +64,5 @@ RUN chmod +x run.sh
 EXPOSE 8501
 
 # Use wrapper script for proper signal handling
+
 ENTRYPOINT ["./run.sh"]
