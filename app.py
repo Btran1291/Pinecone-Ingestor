@@ -1853,15 +1853,20 @@ def main():
 
         with st.expander("⚙️ Advanced Chunking Settings", expanded=False):
             heading_detection_confidence_threshold_ui = st.slider(
-                "Heading Detection Confidence Threshold",
+                "Heading Detection Sensitivity",
                 min_value=0.0,
                 max_value=1.0,
                 value=float(os.environ.get("HEADING_DETECTION_CONFIDENCE_THRESHOLD", DEFAULT_SETTINGS["HEADING_DETECTION_CONFIDENCE_THRESHOLD"])),
                 step=0.01,
                 format="%.2f",
                 help=(
-                    "Minimum confidence score for a text segment to be classified as a heading by Layer 2. "
-                    "Higher values are more strict, lower values are more permissive. Default: 0.65."
+                    "This controls how aggressively the system tries to identify headings and subheadings within your document. "
+                    "**Higher values (e.g., 0.80-1.00)** make the detection more strict, meaning only very clear headings will be recognized. "
+                    "This can result in fewer, larger sections. "
+                    "**Lower values (e.g., 0.00-0.50)** make the detection more lenient, potentially identifying more text segments as headings. "
+                    "This can lead to more, smaller sections. "
+                    "Adjust this if your document's structure isn't being recognized correctly, or if you want more/less granular sections based on headings. "
+                    "Default: 0.65 (a balanced approach)."
                 ),
                 key="config_heading_detection_confidence_threshold"
             )
@@ -1872,32 +1877,46 @@ def main():
                 value=int(os.environ.get("MIN_CHUNKS_PER_SECTION_FOR_MERGE", DEFAULT_SETTINGS["MIN_CHUNKS_PER_SECTION_FOR_MERGE"])),
                 step=1,
                 help=(
-                    "Minimum number of meaningful content elements (paragraphs, list items, etc.) a section must contain "
-                    "after its heading. Sections with fewer elements will be merged with neighbors during Layer 2 post-processing. Default: 2."
+                    "After identifying headings, the system groups related content into sections. "
+                    "This setting ensures that each section contains a minimum number of 'content elements' (like paragraphs or list items). "
+                    "If a detected section has fewer content elements than this value, it will be merged with a neighboring section. "
+                    "**Increase this value** if you find sections are too short or fragmented. "
+                    "**Decrease this value** if you want to preserve very small, distinct sections. "
+                    "Default: 2 (ensures sections have at least two meaningful content parts)."
                 ),
                 key="config_min_chunks_per_section_for_merge"
             )
 
             sentence_split_threshold_chars_ui = st.number_input(
-                "Sentence Split Threshold (characters)",
+                "Auto-Split Long Paragraphs (Characters)",
                 min_value=100,
                 value=int(os.environ.get("SENTENCE_SPLIT_THRESHOLD_CHARS", DEFAULT_SETTINGS["SENTENCE_SPLIT_THRESHOLD_CHARS"])),
                 step=50,
                 help=(
-                    "For sections with medium/low confidence structure, if an individual content element (e.g., a long paragraph) "
-                    "exceeds this character length, it may be further split into sentences to manage chunk size. Default: 300."
+                    "For very long paragraphs or text blocks that aren't clearly structured by headings, "
+                    "this setting tells the system to automatically split them into smaller parts based on sentence boundaries. "
+                    "If a single block of text exceeds this character length, it will be broken down. "
+                    "This helps ensure that individual chunks aren't excessively long, which can be beneficial for embedding quality and retrieval. "
+                    "**Lower this value** to split long paragraphs more aggressively. "
+                    "**Raise this value** to keep longer paragraphs intact. "
+                    "Default: 300 (splits paragraphs longer than 300 characters into sentences)."
                 ),
                 key="config_sentence_split_threshold_chars"
             )
             
             min_chunk_length_ui = st.number_input(
-                "Minimum Chunk Length (characters)",
+                "Minimum Final Chunk Length (Characters)",
                 min_value=1,
                 value=int(os.environ.get("MIN_CHUNK_LENGTH", DEFAULT_SETTINGS["MIN_CHUNK_LENGTH"])),
                 step=10,
                 help=(
-                    "Minimum character length for a final chunk. Chunks shorter than this will be merged with adjacent chunks "
-                    "if possible, to ensure meaningful content. Default: 100."
+                    "This is the absolute minimum character length for any final chunk that gets sent to Pinecone. "
+                    "If a chunk ends up shorter than this value (e.g., after splitting or filtering), "
+                    "the system will try to merge it with an adjacent chunk to create a more meaningful piece of information. "
+                    "This prevents very small, potentially uninformative, chunks from being embedded. "
+                    "**Increase this value** if you want to ensure all chunks are substantial. "
+                    "**Decrease this value** if you need to retain very short, critical pieces of information. "
+                    "Default: 100 (chunks shorter than 100 characters will be merged if possible)."
                 ),
                 key="config_min_chunk_length"
             )
