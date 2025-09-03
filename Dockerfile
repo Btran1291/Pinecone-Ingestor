@@ -1,5 +1,5 @@
 # ---- Build Stage ----
-FROM python:3.13-slim-bookworm AS builder
+FROM python:3.11-slim-bookworm AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /app
@@ -34,7 +34,7 @@ RUN ls -l /app/.venv/bin/python
 
 
 # ---- Production Stage ----
-FROM python:3.13-slim-bookworm AS production
+FROM python:3.11-slim-bookworm AS production
 
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /app
