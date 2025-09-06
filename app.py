@@ -11,16 +11,20 @@ from collections import deque
 from dotenv import load_dotenv
 from langchain_unstructured import UnstructuredLoader
 from langchain_core.documents import Document
+from langchain.storage import InMemoryByteStore
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_experimental.text_splitter import SemanticChunker
 from langchain_openai import OpenAIEmbeddings
 from pinecone import Pinecone, ServerlessSpec
-import pandas as pd
+from langchain_core.messages import HumanMessage
+from langchain_openai import ChatOpenAI
+import base64
 import io
+from PIL import Image
+import pandas as pd
 import tiktoken
 import spacy
-import numpy as np
 import nltk
-import re
 
 try:
     nltk.data.find('tokenizers/punkt')
@@ -89,9 +93,6 @@ DEFAULT_SETTINGS = {
     "MIN_GENERIC_CONTENT_LENGTH": "120",
     "ENABLE_NER_FILTERING": "True",
     "UNSTRUCTURED_STRATEGY": "hi_res",
-    "HEADING_DETECTION_CONFIDENCE_THRESHOLD": "0.65",
-    "MIN_CHUNKS_PER_SECTION_FOR_MERGE": "2",
-    "SENTENCE_SPLIT_THRESHOLD_CHARS": "300",
     "MIN_CHUNK_LENGTH": "100",
 }
 
@@ -111,17 +112,11 @@ PINECONE_METADATA_MAX_BYTES = 40 * 1024  # 40 KB limit for metadata payload
 
 # Constants for dynamic chunking to adhere to Pinecone metadata limits
 SAFETY_BUFFER_BYTES = 1024
-MIN_RE_SPLIT_CHUNK_SIZE = 100
 MAX_UTF8_BYTES_PER_CHAR = 4
 
 # OpenAI embedding API limits
 OPENAI_MAX_TOKENS_PER_EMBEDDING_REQUEST = 300000
 OPENAI_MAX_TEXTS_PER_EMBEDDING_REQUEST = 1000
-
-# Categories from Unstructured.io that are considered important and typically kept during filtering
-STRUCTURAL_CUES_AND_CRITICAL_CONCISE_CONTENT = {
-    "Title", "NarrativeText", "ListItem", "Table", "FigureCaption", "Formula", "Header", "Subheader"
-}
 
 # Metadata keys reserved for internal use or special handling within Pinecone
 RESERVED_METADATA_KEYS = {
@@ -129,6 +124,34 @@ RESERVED_METADATA_KEYS = {
     "page_number", "page", "start_index", "category",
     "original_file_path",
 }
+
+# Recommended allowed keys and priority list (highest -> lowest)
+# Added 'section_id' and 'chunk_index_in_section' for plugin compatibility
+RAG_ALLOWED_KEYS = [
+    "text",
+    "chunk_id",
+    "document_id",
+    "file_name",
+    "section_id", # Added for plugin compatibility
+    "section_heading",
+    "heading_level",
+    "chunk_index_in_section", # Added for plugin compatibility
+    "chunk_confidence",
+    "chunk_index_in_parent", # Kept for internal reference
+    "total_chunks_in_section",
+    "page_number",
+    "languages",
+    "filetype",
+    "last_modified",
+    "start_index", # Added start_index to RAG_ALLOWED_KEYS for better retention
+]
+
+# Keys to always remove (sensitive or irrelevant)
+RAG_DISCARD_KEYS = {
+    "file_directory", "original_file_path", "source", "filename",
+    "element_id", "parent_id", "coordinates", "page", "file_path" # 'start_index' removed from discard
+}
+
 
 # -------- Cached Resource Loading --------
 @st.cache_resource
@@ -195,7 +218,8 @@ def deterministic_document_id(file_name: str, file_bytes: bytes) -> str:
     Ensures uniqueness and handles Pinecone's ID length limit.
     """
     logger = st.session_state.app_logger
-    doc_id = f"{file_name}_{hashlib.sha256(file_bytes).hexdigest()}"
+    # Use the normalized file_name for ID generation
+    doc_id = f"{file_name.lower()}_{hashlib.sha256(file_bytes).hexdigest()}"
     if len(doc_id) > 512:
         doc_id = hashlib.sha256(doc_id.encode("utf-8")).hexdigest()
     logger.debug(f"Generated document ID for {file_name}: {doc_id}")
@@ -227,30 +251,6 @@ def count_tokens(text: str, model_name: str, logger: logging.Logger) -> int:
     except Exception as e:
         logger.error(f"Error counting tokens for model '{model_name}': {e}")
         return len(text) // 3
-
-# Recommended allowed keys and priority list (highest -> lowest)
-RAG_ALLOWED_KEYS = [
-    "text", 
-    "chunk_id",
-    "document_id",
-    "file_name",
-    "section_id",
-    "section_heading",
-    "heading_level",
-    "chunk_confidence",
-    "chunk_index_in_section",
-    "total_chunks_in_section",
-    "page_number",
-    "languages",
-    "filetype",
-    "last_modified",
-]
-
-# Keys to always remove (sensitive or irrelevant)
-RAG_DISCARD_KEYS = {
-    "file_directory", "original_file_path", "source", "filename",
-    "element_id", "parent_id", "coordinates", "start_index", "page", "file_path"
-}
 
 
 def _canonicalize_and_filter_metadata(
@@ -290,13 +290,17 @@ def _canonicalize_and_filter_metadata(
             # If conversion fails, store as string and log a warning
             cleaned["page_number"] = str(meta["page"])
             logger.warning(f"Could not convert page '{meta['page']}' to int. Storing as string.")
-    
+
     meta.pop("page", None)
     meta.pop("page_number", None)
 
     # Canonicalize: prefer 'file_name', but accept 'filename' as fallback
     if "file_name" not in meta and "filename" in meta:
         meta["file_name"] = meta.pop("filename")
+
+    # Ensure file_name is consistently lowercase
+    if "file_name" in meta and isinstance(meta["file_name"], str):
+        meta["file_name"] = meta["file_name"].lower()
 
     # Remove discard keys early
     for k in list(meta.keys()):
@@ -459,806 +463,538 @@ def _shrink_metadata_to_limit(metadata: dict, logger: logging.Logger, pinecone_m
 
     return pruned
 
-def _merge_chunk_metadata(meta1: dict, meta2: dict, logger: logging.Logger) -> dict:
-    """
-    Intelligently merges metadata from two chunks into a single dictionary.
-    Prioritizes meta1 for core identifiers, combines lists, and handles ranges for page numbers.
-    Assumes meta1 and meta2 are already canonicalized.
-    """
-    merged_meta = meta1.copy()
+# -------- Parent Document Generation Helper --------
+def _create_parent_documents(raw_elements: list[Document], logger: logging.Logger) -> tuple[list[Document], InMemoryByteStore]:
+    parent_documents = []
+    parent_doc_store = InMemoryByteStore()
 
-    for key in ["document_id", "file_name", "section_id", "section_heading", "heading_level"]:
-        if key in meta2 and meta1.get(key) != meta2.get(key):
-            logger.warning(f"Metadata merge conflict for key '{key}': '{meta1.get(key)}' vs '{meta2.get(key)}'. Prioritizing '{meta1.get(key)}'.")
-        # merged_meta[key] already has meta1's value, no change needed unless meta1 is missing
+    if not raw_elements:
+        logger.warning("No raw elements provided for parent document creation. Returning empty.")
+        return [], parent_doc_store
 
-    page_values = []
-    
-    for m in [meta1, meta2]:
-        if "page_number" in m and m["page_number"] is not None:
-            if isinstance(m["page_number"], (int, str)):
-                # If it's a single int or string, add it
-                page_values.append(m["page_number"])
-            elif isinstance(m["page_number"], list):
-                # If it's already a list (e.g., from a previous merge), extend
-                page_values.extend(m["page_number"])
-            # Handle string ranges like "1-3"
-            elif isinstance(m["page_number"], str) and '-' in m["page_number"]:
-                try:
-                    start, end = map(int, m["page_number"].split('-'))
-                    page_values.extend(range(start, end + 1))
-                except ValueError:
-                    logger.warning(f"Invalid page range string '{m['page_number']}' during merge. Skipping.")
-            
-    # Process collected page values
-    if page_values:
-        all_page_numbers = set()
-        for p_val in page_values:
-            try:
-                all_page_numbers.add(int(p_val))
-            except (ValueError, TypeError):
-                logger.warning(f"Could not convert page value '{p_val}' to int during merge. Skipping.")
-        
-        unique_pages_sorted = sorted(list(all_page_numbers))
-
-        if unique_pages_sorted:
-            if len(unique_pages_sorted) == 1:
-                merged_meta["page_number"] = unique_pages_sorted[0]
-            else:
-                # Represent as a range string (e.g., "1-5")
-                # This is a common and useful way to represent page ranges for merged chunks.
-                merged_meta["page_number"] = f"{unique_pages_sorted[0]}-{unique_pages_sorted[-1]}"
-        else:
-            merged_meta.pop("page_number", None) # Remove if no valid pages found after processing
-    else:
-        merged_meta.pop("page_number", None) # Remove if no page info was found at all
-    
-    # Start Index (take the minimum)
-    if "start_index" in meta1 and "start_index" in meta2:
-        merged_meta["start_index"] = min(meta1["start_index"], meta2["start_index"])
-    elif "start_index" in meta2:
-        merged_meta["start_index"] = meta2["start_index"]
-
-    # Categories (combine unique categories)
-    categories = set()
-    if "category" in meta1:
-        if isinstance(meta1["category"], list):
-            categories.update(meta1["category"])
-        else:
-            categories.add(meta1["category"])
-    if "category" in meta2:
-        if isinstance(meta2["category"], list):
-            categories.update(meta2["category"])
-        else:
-            categories.add(meta2["category"])
-    if categories:
-        merged_meta["category"] = sorted(list(categories))
-    else:
-        merged_meta.pop("category", None)
-
-    # Languages (combine unique languages)
-    languages = set()
-    if "languages" in meta1:
-        if isinstance(meta1["languages"], list):
-            languages.update(meta1["languages"])
-        else:
-            languages.add(meta1["languages"])
-    if "languages" in meta2:
-        if isinstance(meta2["languages"], list):
-            languages.update(meta2["languages"])
-        else:
-            languages.add(meta2["languages"])
-    if languages:
-        merged_meta["languages"] = sorted(list(languages))
-    else:
-        merged_meta.pop("languages", None)
-
-    # Other metadata keys: prioritize meta1, but add from meta2 if not present in meta1
-    for k, v in meta2.items():
-        if k not in merged_meta: # Only add if not already in meta1
-            merged_meta[k] = v
-        elif k not in ["document_id", "file_name", "section_id", "section_heading", "heading_level",
-                       "page_number", "page", "start_index", "category", "languages", "text", "chunk_id"]:
-            # For other non-critical, non-reserved keys, if values differ, prioritize meta1 but log
-            if merged_meta[k] != v:
-                logger.debug(f"Metadata key '{k}' differs during merge: '{merged_meta[k]}' vs '{v}'. Keeping '{merged_meta[k]}'.")
-
-    return merged_meta
-
-
-
-# -------- Adaptive Document Structure Analysis --------
-def _analyze_document_structure(meaningful_chunks: list[Document], logger: logging.Logger) -> dict:
-    """
-    Analyzes the meaningful_chunks to derive statistical and pattern-based insights
-    about the document's inherent structure. This forms Layer 1 of the intelligent chunking.
-    """
-    doc_context = {}
-    
-    if not meaningful_chunks:
-        logger.warning("No meaningful chunks provided for structural analysis. Returning empty context.")
-        return doc_context
-
-    # --- 1. Statistical Text Analysis ---
-    element_lengths = [len(d.page_content) for d in meaningful_chunks if d.page_content]
-    if element_lengths:
-        doc_context["mean_element_length"] = np.mean(element_lengths)
-        doc_context["median_element_length"] = np.median(element_lengths)
-        doc_context["std_dev_element_length"] = np.std(element_lengths)
-        
-        # Optimal derivation for thresholds: using quartiles and IQR for robustness
-        q1 = np.percentile(element_lengths, 25)
-        q3 = np.percentile(element_lengths, 75)
-        iqr = q3 - q1
-        
-        # Elements significantly shorter than Q1 are candidates for headings
-        # Factor of 1.5 is a common heuristic for outlier detection (e.g., in box plots)
-        doc_context["short_element_threshold"] = max(MIN_RE_SPLIT_CHUNK_SIZE, q1 - 1.5 * iqr) 
-        # Elements significantly longer than Q3 are candidates for large paragraphs/sections
-        doc_context["long_element_threshold"] = q3 + 1.5 * iqr 
-    else:
-        doc_context["mean_element_length"] = 0
-        doc_context["median_element_length"] = 0
-        doc_context["std_dev_element_length"] = 0
-        doc_context["short_element_threshold"] = MIN_RE_SPLIT_CHUNK_SIZE # Fallback
-        doc_context["long_element_threshold"] = 0
-
-    all_lines = []
-    for d in meaningful_chunks:
-        all_lines.extend(d.page_content.splitlines())
-
-    # Line-level feature analysis
-    line_features = {
-        "all_caps": [], "title_case": [], "ends_with_punctuation": [],
-        "starts_with_numbering": [], "leading_indent": [], "short_line": []
-    }
-    short_line_char_threshold = 80 # A fixed threshold for line-level analysis
-
-    for line in all_lines:
-        stripped_line = line.strip()
-        if not stripped_line: continue # Skip empty lines for feature analysis
-
-        # Avoid noise from very short lines when checking capitalization
-        if len(stripped_line) > 5: 
-            line_features["all_caps"].append(stripped_line.isupper())
-            line_features["title_case"].append(stripped_line.istitle())
-        
-        line_features["ends_with_punctuation"].append(stripped_line and stripped_line[-1] in ".!?")
-        line_features["starts_with_numbering"].append(bool(re.match(r'^(\d+\.?|\d+\.\d+\.?|[A-Z]\.?|[IVX]+\.)\s', stripped_line)))
-        line_features["leading_indent"].append(len(line) - len(line.lstrip()) > 2) # More than 2 leading spaces
-        line_features["short_line"].append(len(stripped_line) < short_line_char_threshold)
-
-    total_analyzed_lines = len(all_lines)
-    if total_analyzed_lines > 0:
-        doc_context["prevalence_all_caps_lines"] = np.mean(line_features["all_caps"]) if line_features["all_caps"] else 0
-        doc_context["prevalence_title_case_lines"] = np.mean(line_features["title_case"]) if line_features["title_case"] else 0
-        doc_context["prevalence_ends_with_punctuation"] = np.mean(line_features["ends_with_punctuation"])
-        doc_context["prevalence_starts_with_numbering"] = np.mean(line_features["starts_with_numbering"])
-        doc_context["prevalence_leading_indent"] = np.mean(line_features["leading_indent"])
-        doc_context["prevalence_short_lines"] = np.mean(line_features["short_line"])
-    else:
-        doc_context["prevalence_all_caps_lines"] = 0
-        doc_context["prevalence_title_case_lines"] = 0
-        doc_context["prevalence_ends_with_punctuation"] = 0
-        doc_context["prevalence_starts_with_numbering"] = 0
-        doc_context["prevalence_leading_indent"] = 0
-        doc_context["prevalence_short_lines"] = 0
-
-    # Blank Line Analysis (simple heuristic for now, can be refined with raw file bytes if needed)
-    blank_line_sequences = 0
-    consecutive_blank_lines = 0
-    for line in all_lines:
-        if not line.strip():
-            consecutive_blank_lines += 1
-        else:
-            if consecutive_blank_lines >= 2: # Detect sequences of 2 or more blank lines
-                blank_line_sequences += 1
-            consecutive_blank_lines = 0
-    if consecutive_blank_lines >= 2: # Catch sequence at end of document
-        blank_line_sequences += 1
-    
-    doc_context["avg_blank_lines_between_sections"] = blank_line_sequences # Simple count for now
-
-    # --- 2. Adaptive Pattern Identification ---
-    heading_prefixes_candidates = ["Chapter", "Section", "Appendix", "Figure", "Table", "Part", "Article", "Clause", "Introduction", "Conclusion", "Summary"]
-    detected_prefixes = {p: 0 for p in heading_prefixes_candidates}
-    numbering_patterns_counts = {"decimal_multi_level": 0, "decimal_single_level": 0, "alpha_upper": 0, "roman_upper": 0}
-
-    for d in meaningful_chunks:
-        text_start = d.page_content.strip().split('\n')[0] # Only check first line for patterns
-        
-        # Common Prefixes
-        for prefix in heading_prefixes_candidates:
-            if text_start.lower().startswith(prefix.lower()):
-                detected_prefixes[prefix] += 1
-        
-        # Dominant Numbering Schemes
-        if re.match(r'^\d+\.\d+\.\d+\.?\s', text_start):
-            numbering_patterns_counts["decimal_multi_level"] += 1
-        elif re.match(r'^\d+\.\s', text_start):
-            numbering_patterns_counts["decimal_single_level"] += 1
-        elif re.match(r'^[A-Z]\.\s', text_start):
-            numbering_patterns_counts["alpha_upper"] += 1
-        elif re.match(r'^[IVX]+\.\s', text_start):
-            numbering_patterns_counts["roman_upper"] += 1
-            
-    doc_context["detected_heading_prefixes"] = [p for p, count in detected_prefixes.items() if count > 0]
-    doc_context["dominant_numbering_pattern"] = max(numbering_patterns_counts, key=numbering_patterns_counts.get) if any(numbering_patterns_counts.values()) else "none"
-    
-    # Unstructured Category Distribution
-    category_counts = {}
-    for d in meaningful_chunks:
-        category = d.metadata.get("category", "Unknown")
-        category_counts[category] = category_counts.get(category, 0) + 1
-    doc_context["category_distribution"] = category_counts
-
-    # --- 3. Document Type Inference (Heuristic-based) ---
-    inferred_type = "unknown"
-    
-    # Heuristics for technical/academic reports
-    if (doc_context["prevalence_starts_with_numbering"] > 0.15 or doc_context["category_distribution"].get("Header", 0) > 5) and \
-       (doc_context["category_distribution"].get("Table", 0) > 0 or doc_context["category_distribution"].get("FigureCaption", 0) > 0):
-        inferred_type = "technical_report"
-    # Heuristics for narrative documents (e.g., books)
-    elif doc_context["prevalence_ends_with_punctuation"] > 0.7 and doc_context["mean_element_length"] > 300 and \
-         doc_context["category_distribution"].get("NarrativeText", 0) > doc_context["category_distribution"].get("Title", 0) * 5:
-        inferred_type = "narrative_document"
-    # Heuristics for presentations (e.g., slides)
-    elif doc_context["category_distribution"].get("Title", 0) + doc_context["category_distribution"].get("Header", 0) > len(meaningful_chunks) / 5 and \
-         doc_context["mean_element_length"] < 200:
-        inferred_type = "presentation_slides"
-    # Heuristics for legal documents (more specific keywords)
-    elif any(p in doc_context["detected_heading_prefixes"] for p in ["Article", "Clause"]) or \
-         (doc_context["prevalence_all_caps_lines"] > 0.1 and doc_context["prevalence_starts_with_numbering"] > 0.05):
-        inferred_type = "legal_document"
-    
-    doc_context["inferred_document_type"] = inferred_type
-    
-    logger.debug(f"Document context generated: {doc_context}")
-    return doc_context
-
-# -------- Universal Heading Detection & Hierarchy Extraction --------
-def _extract_document_outline(
-    meaningful_chunks: list[Document],
-    doc_context: dict,
-    heading_detection_confidence_threshold: float,
-    min_chunks_per_section_for_merge: int,
-    logger: logging.Logger
-) -> list[dict]:
-    """
-    Extracts a hierarchical outline of the document by identifying headings and their levels.
-    This forms Layer 2 of the intelligent chunking.
-    """
-    document_outline = []
-    
-    if not meaningful_chunks:
-        logger.warning("No meaningful chunks provided for outline extraction. Returning empty outline.")
-        return document_outline
-
-    # Constants for scoring (can be tuned)
-    WEIGHT_CATEGORY_MATCH = 0.4
-    WEIGHT_LENGTH_PROFILE = 0.2
-    WEIGHT_FORMATTING = 0.2
-    WEIGHT_NUMBERING_PREFIX = 0.15
-    WEIGHT_POSITIONAL = 0.05
-
-    # Adaptive threshold adjustment based on document type
-    adjusted_threshold = heading_detection_confidence_threshold
-    if doc_context.get("inferred_document_type") == "technical_report":
-        adjusted_threshold += 0.05 # Be slightly more stringent for formal docs
-    elif doc_context.get("inferred_document_type") == "narrative_document":
-        adjusted_threshold -= 0.05 # Be slightly more permissive for less formal docs
-    adjusted_threshold = max(0.0, min(1.0, adjusted_threshold)) # Clamp between 0 and 1
-
-    current_heading_stack = [] # Stores (level, section_id)
-
-    # Helper to finalize a section
-    def _finalize_section(current_section_start_idx, current_idx, current_heading_text, current_heading_level, current_confidence, current_parent_id, current_unstructured_category):
-        if current_section_start_idx is not None and current_idx >= current_section_start_idx:
-            document_outline.append({
-                "section_id": str(uuid.uuid4()),
-                "heading_level": current_heading_level,
-                "heading_text": current_heading_text,
-                "start_chunk_index": current_section_start_idx,
-                "end_chunk_index": current_idx,
-                "confidence": current_confidence,
-                "parent_section_id": current_parent_id,
-                "unstructured_category": current_unstructured_category
-            })
-            logger.debug(f"Finalized section: Level {current_heading_level}, Text: '{current_heading_text[:50]}...', Chunks: {current_section_start_idx}-{current_idx}")
-
-    current_section_start_idx = 0
-    current_heading_text = "Document Start"
-    current_heading_level = 0 # Root level
-    current_confidence = 1.0
+    current_parent_content = []
+    current_parent_metadata = {}
     current_parent_id = None
-    current_unstructured_category = "Document"
 
-    for i, chunk in enumerate(meaningful_chunks):
-        text = chunk.page_content.strip()
-        category = chunk.metadata.get("category")
-        
-        if not text:
+    # Define strong structural breaks. These categories from Unstructured.io often mark new sections.
+    MAJOR_STRUCTURAL_BREAKS = {"Title", "Header", "Subheader", "NarrativeText", "ListItem"}
+
+    # Heuristic: If a NarrativeText or ListItem is very short and follows a significant break,
+    # it might be a de-facto heading or a very short, distinct point.
+    SHORT_ELEMENT_AS_BREAK_THRESHOLD = 150 # Characters
+
+    for i, element in enumerate(raw_elements):
+        element_text = (element.page_content or "").strip()
+        element_category = element.metadata.get("category")
+
+        # Skip truly empty elements
+        if not element_text:
             continue
 
-        # Calculate heading confidence score for the current chunk
-        score = 0.0
+        # Check for a new parent document break
+        is_major_break = False
+        if element_category in MAJOR_STRUCTURAL_BREAKS:
+            # If it's a heading-like category, it's a strong break
+            if element_category in {"Title", "Header", "Subheader"}:
+                is_major_break = True
+            # If it's a NarrativeText or ListItem, but it's very short and distinct,
+            # it might also indicate a new logical section.
+            elif len(element_text) < SHORT_ELEMENT_AS_BREAK_THRESHOLD and \
+                 (not current_parent_content or # Always start a new parent if it's the first element
+                  (current_parent_content and len(" ".join(current_parent_content)) > SHORT_ELEMENT_AS_BREAK_THRESHOLD * 2)): # Only break if current parent has significant content
+                is_major_break = True
 
-        # 1. Unstructured Category Match
-        if category in {"Title", "Header", "Subheader"}:
-            score += WEIGHT_CATEGORY_MATCH
-        elif category in {"ListItem", "Table", "FigureCaption", "Formula"}: # These are important but not primary headings
-            score += WEIGHT_CATEGORY_MATCH * 0.5
+        # Also consider significant page number jumps as a break
+        if "page_number" in element.metadata and current_parent_metadata.get("page_number"):
+            try:
+                current_page = int(element.metadata["page_number"])
+                parent_start_page = int(current_parent_metadata["page_number"])
+                if current_page > parent_start_page + 1: # Jump of more than one page
+                    is_major_break = True
+            except (ValueError, TypeError):
+                pass # Ignore if page numbers are not easily convertible to int
 
-        # 2. Length Profile Match (adaptive)
-        if doc_context["short_element_threshold"] and len(text) <= doc_context["short_element_threshold"]:
-            score += WEIGHT_LENGTH_PROFILE * (1 - (len(text) / doc_context["short_element_threshold"])) # Shorter means higher score
-        elif doc_context["mean_element_length"] and len(text) < doc_context["mean_element_length"] / 2: # Also consider significantly shorter than mean
-             score += WEIGHT_LENGTH_PROFILE * 0.5
+        if is_major_break and current_parent_content:
+            # Finalize the previous parent document
+            full_parent_content = "\n\n".join(current_parent_content)
+            parent_doc = Document(
+                page_content=full_parent_content,
+                metadata=current_parent_metadata.copy()
+            )
+            parent_doc.metadata["parent_chunk_id"] = current_parent_id # Assign the ID
+            parent_documents.append(parent_doc)
+            parent_doc_store.mset([(current_parent_id, parent_doc.page_content.encode('utf-8'))]) # Store raw bytes
 
-        # 3. Line-Level Formatting
-        first_line = text.splitlines()[0].strip()
-        if first_line:
-            if first_line.isupper() and len(first_line) > 5: # All caps, not too short
-                score += WEIGHT_FORMATTING * doc_context["prevalence_all_caps_lines"]
-            if first_line.istitle():
-                score += WEIGHT_FORMATTING * doc_context["prevalence_title_case_lines"]
-            if first_line[-1] not in ".!?" and len(first_line) > 10: # Doesn't end with sentence punctuation
-                score += WEIGHT_FORMATTING * 0.5 # Fixed boost for non-sentence endings
+            logger.debug(f"Created parent document '{current_parent_id}' from {len(current_parent_content)} elements.")
 
-        # 4. Numbering/Prefix Match
-        if doc_context["prevalence_starts_with_numbering"] > 0.05 and re.match(r'^(\d+\.?|\d+\.\d+\.?|[A-Z]\.?|[IVX]+\.)\s', first_line):
-            score += WEIGHT_NUMBERING_PREFIX
-        elif any(first_line.lower().startswith(p.lower()) for p in doc_context["detected_heading_prefixes"]):
-            score += WEIGHT_NUMBERING_PREFIX * 0.75
+            # Reset for the new parent document, and initialize with metadata from the *current* element
+            current_parent_content = []
+            current_parent_id = str(uuid.uuid4()) # Generate a new ID for the new parent
+            current_parent_metadata = element.metadata.copy()
+            # Propagate section_id and section_heading if available from Unstructured
+            if "section_id" in element.metadata:
+                current_parent_metadata["section_id"] = element.metadata["section_id"]
+            if "section_heading" in element.metadata:
+                current_parent_metadata["section_heading"] = element.metadata["section_heading"]
+            # Ensure page_number is handled correctly for the start of a parent
+            if "page_number" in element.metadata:
+                try:
+                    current_parent_metadata["page_number"] = int(element.metadata["page_number"])
+                except (ValueError, TypeError):
+                    current_parent_metadata["page_number"] = str(element.metadata["page_number"])
 
-        if i > 0 and not meaningful_chunks[i-1].page_content.strip():
-             score += WEIGHT_POSITIONAL * 0.5
+        if not current_parent_id: # This condition will only be true for the very first element of the document
+            current_parent_id = str(uuid.uuid4())
+            current_parent_metadata = element.metadata.copy()
+            # Propagate section_id and section_heading if available from Unstructured
+            if "section_id" in element.metadata:
+                current_parent_metadata["section_id"] = element.metadata["section_id"]
+            if "section_heading" in element.metadata:
+                current_parent_metadata["section_heading"] = element.metadata["section_heading"]
+            elif element.metadata.get("category") in {"Title", "Header", "Subheader"}:
+                current_parent_metadata["section_heading"] = element.page_content.strip()
+            # Ensure page_number is handled correctly for the start of a parent
+            if "page_number" in element.metadata:
+                try:
+                    current_parent_metadata["page_number"] = int(element.metadata["page_number"])
+                except (ValueError, TypeError):
+                    current_parent_metadata["page_number"] = str(element.metadata["page_number"])
 
-        # Normalize score to 0-1 range (simple sum might exceed 1)
-        heading_score = min(1.0, score / (WEIGHT_CATEGORY_MATCH + WEIGHT_LENGTH_PROFILE + WEIGHT_FORMATTING + WEIGHT_NUMBERING_PREFIX + WEIGHT_POSITIONAL))
 
-        is_heading = heading_score >= adjusted_threshold
-        logger.debug(f"Chunk {i}: '{text[:50]}...' Category: {category}, Score: {heading_score:.2f}, Is Heading: {is_heading}")
+        current_parent_content.append(element_text)
 
-        if is_heading:
-            # Finalize the previous section
-            if i > current_section_start_idx: # Only finalize if current section has content
-                _finalize_section(current_section_start_idx, i - 1, current_heading_text, current_heading_level, current_confidence, current_parent_id, current_unstructured_category)
-            
-            # Infer new heading level
-            new_level = 1 # Default to level 1
-            if re.match(r'^\d+\.\d+\.\d+\.?\s', first_line): new_level = 3
-            elif re.match(r'^\d+\.\d+\.?\s', first_line): new_level = 2
-            elif re.match(r'^\d+\.\s', first_line): new_level = 1
-            elif re.match(r'^[A-Z]\.\s', first_line): new_level = 1 # A. Introduction
-            elif category == "Subheader": new_level = (current_heading_level + 1) if current_heading_level < 6 else 6
-            elif category == "Header": new_level = (current_heading_level + 1) if current_heading_level < 6 else 6
-            elif category == "Title": new_level = 1 # Major title
+        # Update page number range for the parent document
+        if "page_number" in element.metadata:
+            try:
+                current_page_num = int(element.metadata["page_number"])
+                if "page_number_start" not in current_parent_metadata or current_page_num < current_parent_metadata["page_number_start"]:
+                    current_parent_metadata["page_number_start"] = current_page_num
+                if "page_number_end" not in current_parent_metadata or current_page_num > current_parent_metadata["page_number_end"]:
+                    current_parent_metadata["page_number_end"] = current_page_num
+            except (ValueError, TypeError):
+                pass # Non-integer page numbers will be handled as strings if needed, but not for range logic
 
-            # Hierarchy enforcement: don't jump levels too much
-            if current_heading_stack:
-                last_level, _ = current_heading_stack[-1]
-                if new_level > last_level + 1: # Cannot jump from L1 to L3 directly, make it L2
-                    new_level = last_level + 1
-                elif new_level < last_level: # Going up the hierarchy
-                    while current_heading_stack and current_heading_stack[-1][0] >= new_level:
-                        current_heading_stack.pop()
-            
-            # Update current section details
-            current_section_start_idx = i
-            current_heading_text = first_line
-            current_heading_level = new_level
-            current_confidence = heading_score
-            current_parent_id = current_heading_stack[-1][1] if current_heading_stack else None
-            current_unstructured_category = category
+    # Finalize the last parent document
+    if current_parent_content:
+        full_parent_content = "\n\n".join(current_parent_content)
+        parent_doc = Document(
+            page_content=full_parent_content,
+            metadata=current_parent_metadata.copy()
+        )
+        parent_doc.metadata["parent_chunk_id"] = current_parent_id
+        parent_documents.append(parent_doc)
+        parent_doc_store.mset([(current_parent_id, parent_doc.page_content.encode('utf-8'))])
 
-            # Update heading stack
-            current_heading_stack.append((new_level, document_outline[-1]["section_id"] if document_outline else None))
-            # If stack is empty, this is the first top-level heading, its parent is None.
-            # If document_outline is empty, it means this is the very first section.
+        logger.debug(f"Created final parent document '{current_parent_id}' from {len(current_parent_content)} elements.")
 
-    # Finalize the last section after the loop
-    _finalize_section(current_section_start_idx, len(meaningful_chunks) - 1, current_heading_text, current_heading_level, current_confidence, current_parent_id, current_unstructured_category)
+    logger.info(f"Generated {len(parent_documents)} parent documents for '{raw_elements[0].metadata.get('file_name', 'N/A')}'.")
+    return parent_documents, parent_doc_store
 
-    # --- Robust Fallback Strategies (if primary detection failed or was too sparse) ---
-    if not document_outline or len(document_outline) < 2: # If less than 2 sections detected, or none
-        logger.info("Primary heading detection yielded sparse results. Applying fallback strategies.")
-        document_outline = [] # Reset outline
-
-        # Fallback 1: Blank Line Sectioning
-        if doc_context.get("avg_blank_lines_between_sections", 0) >= 1.5: # If blank lines are somewhat common
-            current_fallback_section_start_idx = 0
-            fallback_section_counter = 1
-            for i in range(1, len(meaningful_chunks)):
-                # Heuristic: if a significant break (e.g., 2+ lines) or a very short chunk followed by a long one
-                if not meaningful_chunks[i-1].page_content.strip() and not meaningful_chunks[i].page_content.strip(): # Two consecutive empty lines
-                    if i > current_fallback_section_start_idx:
-                        document_outline.append({
-                            "section_id": str(uuid.uuid4()),
-                            "heading_level": 1,
-                            "heading_text": f"Content Block {fallback_section_counter}",
-                            "start_chunk_index": current_fallback_section_start_idx,
-                            "end_chunk_index": i - 1,
-                            "confidence": 0.4, # Lower confidence
-                            "parent_section_id": None,
-                            "unstructured_category": "FallbackSection"
-                        })
-                        fallback_section_counter += 1
-                        current_fallback_section_start_idx = i
-            # Add last fallback section
-            if len(meaningful_chunks) > current_fallback_section_start_idx:
-                 document_outline.append({
-                    "section_id": str(uuid.uuid4()),
-                    "heading_level": 1,
-                    "heading_text": f"Content Block {fallback_section_counter}",
-                    "start_chunk_index": current_fallback_section_start_idx,
-                    "end_chunk_index": len(meaningful_chunks) - 1,
-                    "confidence": 0.4,
-                    "parent_section_id": None,
-                    "unstructured_category": "FallbackSection"
-                })
-        
-        # Fallback 2: Paragraph Grouping (if no sections yet or still too few)
-        if not document_outline or len(document_outline) < 2:
-            document_outline = [] # Reset again
-            fallback_section_counter = 1
-            chunks_per_group = 5 # Group into blocks of 5 meaningful chunks
-            for i in range(0, len(meaningful_chunks), chunks_per_group):
-                document_outline.append({
-                    "section_id": str(uuid.uuid4()),
-                    "heading_level": 1,
-                    "heading_text": f"Content Block {fallback_section_counter}",
-                    "start_chunk_index": i,
-                    "end_chunk_index": min(i + chunks_per_group - 1, len(meaningful_chunks) - 1),
-                    "confidence": 0.3, # Even lower confidence
-                    "parent_section_id": None,
-                    "unstructured_category": "FallbackParagraphGroup"
-                })
-                fallback_section_counter += 1
-
-    # --- Post-processing: Merge very small sections ---
-    # This loop might need to run multiple times if merges create new small sections
-    merged_count = 0
-    while True:
-        initial_outline_len = len(document_outline)
-        new_outline = []
-        i = 0
-        while i < len(document_outline):
-            current_section = document_outline[i]
-            section_content_length = current_section["end_chunk_index"] - current_section["start_chunk_index"] + 1
-            
-            # Only merge if it's a content section (level > 0) and has too few content elements
-            if current_section["heading_level"] > 0 and section_content_length < min_chunks_per_section_for_merge:
-                logger.debug(f"Merging small section: '{current_section['heading_text'][:50]}...' (len: {section_content_length})")
-                merged_count += 1
-                # Try to merge with previous section if available and same level or previous is parent
-                if new_outline and new_outline[-1]["heading_level"] >= current_section["heading_level"]:
-                    new_outline[-1]["end_chunk_index"] = current_section["end_chunk_index"]
-                    # Optionally, update heading text to reflect combined content
-                    new_outline[-1]["heading_text"] += f" / {current_section['heading_text']}"
-                    new_outline[-1]["confidence"] = min(new_outline[-1]["confidence"], current_section["confidence"]) # Take lower confidence
-                # Else, merge with next section
-                elif i + 1 < len(document_outline):
-                    next_section = document_outline[i+1]
-                    next_section["start_chunk_index"] = current_section["start_chunk_index"]
-                    next_section["heading_text"] = f"{current_section['heading_text']} / {next_section['heading_text']}"
-                    next_section["confidence"] = min(next_section["confidence"], current_section["confidence"])
-                    new_outline.append(next_section) # Add the modified next section
-                    i += 1 # Skip next section as it's merged
-                else: # Cannot merge, keep as is (should be rare with good min_chunks_per_section_for_merge)
-                    new_outline.append(current_section)
-            else:
-                new_outline.append(current_section)
-            i += 1
-        
-        document_outline = new_outline
-        if len(document_outline) == initial_outline_len: # No more merges happened
-            break
-    
-    logger.info(f"Post-processing merged {merged_count} small sections.")
-    logger.debug(f"Final document outline: {document_outline}")
-    return document_outline
-
-# -------- Adaptive Hierarchical Semantic Chunking --------
-def _generate_semantic_chunks(
-    meaningful_chunks: list[Document],
-    document_outline: list[dict],
-    user_chunk_size: int,
-    user_chunk_overlap: int,
-    pinecone_metadata_max_bytes: int,
-    parsed_global_custom_metadata: dict,
-    document_specific_metadata_map: dict,
-    document_id: str,
-    file_name: str,
-    sentence_split_threshold_chars: int,
-    min_chunk_length: int,
+# -------- Content Filtering Helper --------
+def _filter_parent_content(
+    parent_documents: list[Document],
+    enable_filtering: bool,
+    whitelisted_keywords_set: set[str],
+    min_generic_content_length: int,
+    enable_ner_filtering: bool,
+    nlp: spacy.Language, # SpaCy model for NER
     logger: logging.Logger
 ) -> list[Document]:
     """
-    Generates final, semantically coherent, and context-rich chunks based on the document outline.
-    This forms Layer 3 of the intelligent chunking.
+    Applies content filtering rules to a list of parent documents.
+    Removes generic, short content unless it's whitelisted,
+    or contains named entities (if NER filtering is enabled).
+
+    Args:
+        parent_documents: A list of Document objects representing parent sections.
+        enable_filtering: Boolean, whether to apply filtering at all.
+        whitelisted_keywords_set: A set of keywords to always keep.
+        min_generic_content_length: Minimum character length for generic content.
+        enable_ner_filtering: Boolean, whether to use NER for short generic content.
+        nlp: The loaded SpaCy model for NER.
+        logger: The application logger.
+
+    Returns:
+        A new list of Document objects containing only the "meaningful" content,
+        with original parent metadata preserved.
     """
-    final_semantic_chunks = [] # This list will accumulate chunks from ALL sections
+    filtered_parent_documents = []
 
-    # Constants for internal re-chunking (from original code, now centralized)
-    MIN_RE_SPLIT_CHUNK_SIZE = 100
-    MAX_UTF8_BYTES_PER_CHAR = 4
-    SAFETY_BUFFER_BYTES = 1024
+    if not enable_filtering:
+        logger.info("Content filtering is disabled. All parent document content will be kept.")
+        return parent_documents # Return all documents if filtering is off
 
-    # Helper for internal re-splitting if metadata payload is too large
-    def _resplit_chunk_for_pinecone_limit(text_content, original_metadata, current_logger):
-        non_text_metadata_bytes = len(json.dumps(original_metadata).encode("utf-8"))
-        remaining_space_for_text = pinecone_metadata_max_bytes - non_text_metadata_bytes - SAFETY_BUFFER_BYTES
-        remaining_space_for_text = max(0, remaining_space_for_text)
-        new_re_split_chunk_size_chars = max(MIN_RE_SPLIT_CHUNK_SIZE, remaining_space_for_text // MAX_UTF8_BYTES_PER_CHAR)
+    for parent_doc in parent_documents:
+        original_content = (parent_doc.page_content or "").strip()
 
-        current_logger.warning(f"Chunk too large for Pinecone metadata. Re-splitting with max_chars={new_re_split_chunk_size_chars}.")
+        if not original_content:
+            logger.debug(f"Skipping empty parent document content for '{parent_doc.metadata.get('file_name', 'N/A')}' (Parent ID: {parent_doc.metadata.get('parent_chunk_id', 'N/A')}).")
+            continue # Skip if parent document is empty after stripping
 
-        # Use a simple character splitter for this emergency re-split
-        emergency_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=new_re_split_chunk_size_chars,
-            chunk_overlap=0,
-            length_function=len,
-            add_start_index=True
-        )
-        temp_doc_for_resplit = Document(page_content=text_content, metadata={})
-        sub_chunks = emergency_splitter.split_documents([temp_doc_for_resplit])
+        keep_this_parent = False
 
-        resplit_docs = []
-        for sc in sub_chunks:
-            # Ensure original metadata is carried over and text is updated
-            new_meta = original_metadata.copy()
-            new_meta["text"] = sc.page_content # Update text field
-            resplit_docs.append(Document(page_content=sc.page_content, metadata=new_meta))
-        return resplit_docs
+        # Rule 1: Whitelisted keywords
+        if any(keyword in original_content.lower() for keyword in whitelisted_keywords_set):
+            keep_this_parent = True
+            logger.debug(f"Kept parent doc (Parent ID: {parent_doc.metadata.get('parent_chunk_id', 'N/A')}) due to whitelisted keyword.")
 
-    # Iterate through each section identified in the outline
-    for section_dict in document_outline:
-        section_id = section_dict["section_id"]
-        heading_level = section_dict["heading_level"]
-        heading_text = section_dict["heading_text"]
-        start_idx = section_dict["start_chunk_index"]
-        end_idx = section_dict["end_chunk_index"]
-        confidence = section_dict["confidence"]
+        # Rule 2: Sufficiently long generic content
+        elif len(original_content) >= min_generic_content_length:
+            keep_this_parent = True
+            logger.debug(f"Kept parent doc (Parent ID: {parent_doc.metadata.get('parent_chunk_id', 'N/A')}) due to sufficient length ({len(original_content)} chars).")
 
-        # Determine the content elements for this specific section
-        content_elements_for_section = meaningful_chunks[start_idx : end_idx + 1]
+        # Rule 3: NER filtering for short generic content (if enabled and SpaCy model loaded)
+        elif enable_ner_filtering and nlp is not None:
+            # Only apply NER if it's short and not already kept by other rules
+            doc_spacy = nlp(original_content)
+            if doc_spacy.ents:
+                keep_this_parent = True
+                logger.debug(f"Kept short parent doc (Parent ID: {parent_doc.metadata.get('parent_chunk_id', 'N/A')}) due to NER. Entities: {[ent.text for ent in doc_spacy.ents]}")
 
-        # Construct section prefix (e.g., markdown heading)
-        section_prefix = f"#{'#' * min(heading_level, 6)} {heading_text}\n\n"
+        if keep_this_parent:
+            # Create a new Document object for the filtered content, preserving original metadata
+            filtered_doc = Document(
+                page_content=original_content,
+                metadata=parent_doc.metadata.copy()
+            )
+            filtered_parent_documents.append(filtered_doc)
+        else:
+            logger.debug(f"Filtered out parent document (Parent ID: {parent_doc.metadata.get('parent_chunk_id', 'N/A')}) from '{parent_doc.metadata.get('file_name', 'N/A')}' due to filtering rules.")
 
-        # --- PHASE 1: Aggregation into raw semantic chunks for THIS section ---
-        raw_semantic_chunks_for_section = [] # Initialize for EACH section
-        current_text_buffer = []
-        current_metadata_accumulator = {}
+    logger.info(f"Filtered {len(parent_documents)} parent documents down to {len(filtered_parent_documents)} meaningful parent documents.")
+    return filtered_parent_documents
 
-        MIN_CONTENT_FOR_BOUNDARY_SPLIT = max(100, user_chunk_size // 5)
+# -------- Semantic Chunking & Child Document Generation Helper --------
+def _generate_child_chunks(
+    filtered_parent_documents: list[Document],
+    embedding_model_name: str,
+    embedding_api_key: str,
+    embedding_dimension: int,
+    pinecone_metadata_max_bytes: int,
+    parsed_global_custom_metadata: dict,
+    document_specific_metadata_map: dict,
+    logger: logging.Logger,
+    semantic_chunker_threshold_type: str = "percentile",
+    semantic_chunker_threshold_amount: float = 95.0,
+    min_child_chunk_size: int = 100,
+    configured_chunk_size: int = 1000, # Added for fallback
+    configured_chunk_overlap: int = 200, # Added for fallback
+) -> list[Document]:
+    """
+    Generates smaller, semantically coherent "child" chunks from parent documents.
+    These child chunks are designed for precise retrieval and are linked back to their parents.
 
-        for i, element in enumerate(content_elements_for_section):
-            element_text = element.page_content.strip()
-            if not element_text:
-                continue # Skip empty elements
+    Args:
+        filtered_parent_documents: A list of Document objects (parent documents) after filtering.
+        embedding_model_name: The name of the OpenAI embedding model.
+        embedding_api_key: The OpenAI API key.
+        embedding_dimension: The dimensionality of the embedding vectors (user-configured).
+        pinecone_metadata_max_bytes: Pinecone's metadata byte limit.
+        parsed_global_custom_metadata: Global custom metadata to apply to child chunks.
+        document_specific_metadata_map: Map of document-specific metadata.
+        logger: The application logger.
+        semantic_chunker_threshold_type: Type of threshold for semantic chunking.
+        semantic_chunker_threshold_amount: Amount for the semantic chunking threshold.
+        min_child_chunk_size: Minimum character length for a child chunk.
+        configured_chunk_size: User-configured chunk size for fallback splitter.
+        configured_chunk_overlap: User-configured chunk overlap for fallback splitter.
 
-            # Initialize accumulator with first element's metadata if it's empty
-            if not current_metadata_accumulator:
-                current_metadata_accumulator = element.metadata.copy()
-            else:
-                # Merge current element's metadata into the accumulator
-                current_metadata_accumulator = _merge_chunk_metadata(current_metadata_accumulator, element.metadata, logger)
+    Returns:
+        A list of Document objects, each representing a "child" chunk,
+        with metadata linking it to its parent.
+    """
+    all_child_chunks = []
 
-            # Handle very long individual elements by pre-splitting into sentences
-            if len(element_text) > sentence_split_threshold_chars:
-                logger.debug(f"Pre-splitting long element ({len(element_text)} chars) into sentences for section '{heading_text}'.")
-                sentences = nltk.sent_tokenize(element_text)
-                for sent_idx, sentence in enumerate(sentences):
-                    sentence_meta = element.metadata.copy()
-                    sentence_meta["start_index"] = sentence_meta.get("start_index", 0) + element_text.find(sentence)
+    if not filtered_parent_documents:
+        logger.warning("No filtered parent documents provided for child chunk generation. Returning empty.")
+        return []
 
-                    # Check if adding this sentence would cause a split
-                    temp_buffer_len = len(" ".join(current_text_buffer))
-                    if temp_buffer_len + len(sentence) > user_chunk_size and current_text_buffer:
-                        # Finalize current chunk from buffer
-                        raw_semantic_chunks_for_section.append(Document(
-                            page_content=section_prefix + " ".join(current_text_buffer),
-                            metadata=current_metadata_accumulator.copy()
-                        ))
-                        current_text_buffer = [sentence]
-                    else:
-                        current_text_buffer.append(sentence)
-            else:
-                should_finalize_current_chunk = False
-                current_buffer_content_length = len(" ".join(current_text_buffer))
+    # Initialize the embedding model for the SemanticChunker with user-configured dimension
+    embeddings_for_chunker = OpenAIEmbeddings(
+        openai_api_key=embedding_api_key,
+        model=embedding_model_name,
+        dimensions=embedding_dimension
+    )
 
-                if current_buffer_content_length + len(element_text) > user_chunk_size:
-                    should_finalize_current_chunk = True
-                elif element.metadata.get("category") in STRUCTURAL_CUES_AND_CRITICAL_CONCISE_CONTENT and \
-                     current_buffer_content_length > MIN_CONTENT_FOR_BOUNDARY_SPLIT:
-                    should_finalize_current_chunk = True
+    # Initialize the SemanticChunker
+    semantic_text_splitter = SemanticChunker(
+        embeddings_for_chunker,
+        breakpoint_threshold_type=semantic_chunker_threshold_type,
+        breakpoint_threshold_amount=semantic_chunker_threshold_amount,
+    )
 
-                if should_finalize_current_chunk and current_text_buffer:
-                    raw_semantic_chunks_for_section.append(Document(
-                        page_content=section_prefix + " ".join(current_text_buffer),
-                        metadata=current_metadata_accumulator.copy()
-                    ))
-                    current_text_buffer = [element_text]
-                else:
-                    current_text_buffer.append(element_text)
+    for parent_doc in filtered_parent_documents:
+        parent_content = (parent_doc.page_content or "").strip()
+        parent_chunk_id = parent_doc.metadata.get("parent_chunk_id")
 
-        # Finalize any remaining content in the buffer after the loop for THIS section
-        if current_text_buffer:
-            raw_semantic_chunks_for_section.append(Document(
-                page_content=section_prefix + " ".join(current_text_buffer),
-                metadata=current_metadata_accumulator.copy()
-            ))
+        if not parent_content:
+            logger.warning(f"Parent document (ID: {parent_chunk_id}) has no content after filtering. Skipping child chunk generation.")
+            continue
 
-        logger.info(f"Phase 1: Aggregated {len(content_elements_for_section)} meaningful elements into {len(raw_semantic_chunks_for_section)} raw semantic chunks for section '{heading_text}'.")
+        logger.debug(f"Generating child chunks for parent document (ID: {parent_chunk_id}, File: {parent_doc.metadata.get('file_name', 'N/A')})...")
 
-        # --- PHASE 2: Explicit Overlap Generation for THIS section ---
-        chunks_with_overlap_for_section = [] # Initialize for EACH section
-        previous_chunk_overlap_text = ""
-        previous_chunk_metadata_for_overlap = {}
+        try:
+            # Semantic chunking
+            child_docs_from_parent = semantic_text_splitter.create_documents([parent_content])
+        except Exception as e:
+            logger.error(f"Error during semantic chunking for parent ID {parent_chunk_id}: {e}. Falling back to RecursiveCharacterTextSplitter.")
+            # Fallback to RecursiveCharacterTextSplitter if semantic chunking fails
+            fallback_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=configured_chunk_size, # Use user-configured chunk size
+                chunk_overlap=configured_chunk_overlap, # Use user-configured chunk overlap
+                length_function=len,
+                add_start_index=True
+            )
+            child_docs_from_parent = fallback_splitter.create_documents([parent_content])
 
-        for i, chunk in enumerate(raw_semantic_chunks_for_section):
-            current_chunk_content = chunk.page_content
-            current_chunk_metadata = chunk.metadata.copy()
 
-            if previous_chunk_overlap_text:
-                # Check if prepending overlap would make the chunk excessively large
-                if len(current_chunk_content) + len(previous_chunk_overlap_text) > user_chunk_size * 1.5:
-                    # Trim overlap if it makes the chunk too large
-                    trimmed_overlap = previous_chunk_overlap_text[-(user_chunk_overlap // 2):] # Take last half of target overlap
-                    logger.warning(f"Trimmed overlap for chunk {i} ('{chunk.metadata.get('chunk_id', 'N/A')}') from {len(previous_chunk_overlap_text)} to {len(trimmed_overlap)} chars to prevent excessive chunk size.")
-                    current_chunk_content = trimmed_overlap + "\n\n" + current_chunk_content
-                else:
-                    current_chunk_content = previous_chunk_overlap_text + "\n\n" + current_chunk_content
+        temp_child_chunks = []
+        for child_idx, child_doc in enumerate(child_docs_from_parent):
+            child_text = (child_doc.page_content or "").strip()
 
-                current_chunk_metadata["has_leading_overlap"] = True
+            if not child_text or len(child_text) < min_child_chunk_size:
+                logger.debug(f"Skipping child chunk {child_idx} (Parent ID: {parent_chunk_id}) due to being too short or empty ({len(child_text)} chars).")
+                continue # Skip very short or empty child chunks
 
-            sentences = nltk.sent_tokenize(chunk.page_content) # Use original content for overlap extraction
-            overlap_sentences = []
-            current_overlap_len = 0
-            for sent in reversed(sentences): # Iterate backwards to get sentences from the end
-                if current_overlap_len + len(sent) + 1 <= user_chunk_overlap: # +1 for space
-                    overlap_sentences.insert(0, sent) # Insert at beginning to maintain order
-                    current_overlap_len += len(sent) + 1
-                else:
-                    break
+            # Inherit parent metadata and add child-specific metadata
+            child_metadata = parent_doc.metadata.copy()
+            child_metadata["child_chunk_id"] = deterministic_chunk_id(parent_chunk_id, child_text, child_metadata.get("page_number", ""), child_doc.metadata.get("start_index", ""))
+            child_metadata["chunk_index_in_parent"] = child_idx
 
-            if overlap_sentences:
-                previous_chunk_overlap_text = " ".join(overlap_sentences)
-                previous_chunk_metadata_for_overlap = chunk.metadata.copy() # Store metadata for next iteration
-            else:
-                # Fallback to character-based if no semantic units fit
-                previous_chunk_overlap_text = chunk.page_content[-user_chunk_overlap:]
-                previous_chunk_metadata_for_overlap = chunk.metadata.copy()
-                logger.debug(f"Fallback to character-based overlap for chunk {i}.")
+            # Align with plugin's expected metadata: chunk_index_in_section
+            child_metadata["chunk_index_in_section"] = child_idx # Map child_idx to chunk_index_in_section
 
-            # Create the Document for this chunk with its content and metadata
-            chunks_with_overlap_for_section.append(Document(page_content=current_chunk_content, metadata=current_chunk_metadata))
+            child_metadata["category"] = "semantic_text_chunk" # Tag this as a semantic text chunk
 
-        logger.info(f"Phase 2: Applied overlap, resulting in {len(chunks_with_overlap_for_section)} chunks for section '{heading_text}'.")
+            # Ensure 'text' field is present for Pinecone metadata
+            child_metadata["text"] = child_text
 
-        # --- PHASE 3: Minimum Length Enforcement for THIS section ---
-        post_processed_chunks_for_section = [] # Initialize for EACH section
-        i = 0
-        while i < len(chunks_with_overlap_for_section):
-            current_chunk = chunks_with_overlap_for_section[i]
-
-            if len(current_chunk.page_content) < min_chunk_length:
-                logger.debug(f"Chunk {i} ('{current_chunk.metadata.get('chunk_id', 'N/A')}') is short ({len(current_chunk.page_content)} chars). Attempting to merge.")
-
-                merged = False
-                # Try to merge with the next chunk (preferred)
-                if i + 1 < len(chunks_with_overlap_for_section):
-                    next_chunk = chunks_with_overlap_for_section[i+1]
-                    merged_content = current_chunk.page_content + "\n\n" + next_chunk.page_content
-
-                    # Check if merging would make it excessively large
-                    if len(merged_content) < user_chunk_size * 1.5: # Allow some flexibility
-                        merged_metadata = _merge_chunk_metadata(current_chunk.metadata, next_chunk.metadata, logger)
-                        post_processed_chunks_for_section.append(Document(page_content=merged_content, metadata=merged_metadata))
-                        logger.info(f"Merged short chunk {i} with next chunk {i+1}.")
-                        i += 1 # Skip the next chunk as it's been merged
-                        merged = True
-                    else:
-                        logger.warning(f"Skipping merge of short chunk {i} with next chunk {i+1} as it would exceed 1.5x user_chunk_size ({len(merged_content)} chars).")
-
-                if not merged:
-                    post_processed_chunks_for_section.append(current_chunk)
-                    logger.warning(f"Chunk {i} ('{current_chunk.metadata.get('chunk_id', 'N/A')}') is short ({len(current_chunk.page_content)} chars) and could not be merged. Adding as is.")
-            else:
-                post_processed_chunks_for_section.append(current_chunk)
-            i += 1
-
-        # If after all merging, we end up with fewer chunks, update the list
-        if not post_processed_chunks_for_section and chunks_with_overlap_for_section: # Edge case: all chunks were short and merged, but nothing was added
-            post_processed_chunks_for_section = chunks_with_overlap_for_section # Fallback to original if nothing was added
-        elif not post_processed_chunks_for_section and not chunks_with_overlap_for_section:
-            pass
-
-        logger.info(f"Phase 3: Enforced minimum length, resulting in {len(post_processed_chunks_for_section)} chunks for section '{heading_text}'.")
-
-        # --- PHASE 4: Final Metadata Enrichment and Pinecone Limit Check for THIS section ---
-        final_section_chunks_for_this_section = [] # Initialize for EACH section
-        for chunk_idx, chunk in enumerate(post_processed_chunks_for_section):
-            final_content = chunk.page_content
-            initial_chunk_metadata = chunk.metadata.copy()
-
-            sanitized_meta = _canonicalize_and_filter_metadata(
-                initial_chunk_metadata,
-                parsed_global_custom_metadata,
-                document_specific_metadata_map.get(file_name, {}),
-                logger
+            # Final metadata canonicalization and size shrinking for Pinecone
+            sanitized_pruned_metadata = _shrink_metadata_to_limit(
+                _canonicalize_and_filter_metadata(
+                    child_metadata,
+                    parsed_global_custom_metadata,
+                    document_specific_metadata_map.get(child_metadata.get('file_name', ''), {}),
+                    logger
+                ),
+                logger,
+                pinecone_metadata_max_bytes
             )
 
-            # Ensure core document/section metadata is present (it should be from _merge_chunk_metadata)
-            sanitized_meta.setdefault("document_id", document_id)
-            sanitized_meta.setdefault("file_name", file_name)
-            sanitized_meta.setdefault("section_id", section_id)
-            sanitized_meta.setdefault("section_heading", heading_text)
-            sanitized_meta.setdefault("heading_level", heading_level)
-            sanitized_meta.setdefault("chunk_confidence", float(confidence))
-            sanitized_meta.setdefault("chunk_index_in_section", chunk_idx)
-            sanitized_meta.setdefault("total_chunks_in_section", len(post_processed_chunks_for_section))
+            # If text was truncated during metadata shrinking, update page_content
+            if sanitized_pruned_metadata.get("text_truncated", False):
+                child_doc.page_content = sanitized_pruned_metadata["text"]
+                logger.warning(f"Child chunk (ID: {sanitized_pruned_metadata.get('child_chunk_id', 'N/A')}) text truncated during final metadata shrink.")
 
-            # Generate a base chunk ID for this logical chunk (before potential re-splitting)
-            base_chunk_id = deterministic_chunk_id(
-                document_id,
-                final_content,
-                sanitized_meta.get("page_number", sanitized_meta.get("page", "")),
-                sanitized_meta.get("start_index", "")
-            )
-            sanitized_meta["chunk_id"] = base_chunk_id
+            temp_child_chunks.append(Document(page_content=child_doc.page_content, metadata=sanitized_pruned_metadata))
 
-            temp_meta_with_full_text = sanitized_meta.copy()
-            temp_meta_with_full_text["text"] = final_content
+        all_child_chunks.extend(temp_child_chunks)
 
-            total_chunk_size_bytes = 0
+    logger.info(f"Generated {len(all_child_chunks)} child chunks from {len(filtered_parent_documents)} parent documents.")
+    return all_child_chunks
+
+# -------- Multi-Vector Indexing for Special Content Helper --------
+def _process_special_elements(
+    raw_elements: list[Document],
+    parent_doc_store: InMemoryByteStore,
+    embedding_model_name: str,
+    embedding_api_key: str,
+    embedding_dimension: int,
+    pinecone_metadata_max_bytes: int,
+    parsed_global_custom_metadata: dict,
+    document_specific_metadata_map: dict,
+    logger: logging.Logger
+) -> list[Document]:
+    """
+    Identifies and processes special elements (tables, images/figures) from raw_elements.
+    Generates LLM-based summaries for these, creates child chunks from summaries,
+    and stores raw content in the parent_doc_store.
+
+    Args:
+        raw_elements: The initial list of Document objects from UnstructuredLoader.
+        parent_doc_store: The InMemoryByteStore where parent documents are stored.
+                          We'll also use it to store raw special content.
+        embedding_model_name: The name of the OpenAI embedding model.
+        embedding_api_key: The OpenAI API key.
+        embedding_dimension: The dimensionality of the embedding vectors.
+        pinecone_metadata_max_bytes: Pinecone's metadata byte limit.
+        parsed_global_custom_metadata: Global custom metadata.
+        document_specific_metadata_map: Document-specific metadata map.
+        logger: The application logger.
+
+    Returns:
+        A list of Document objects, each representing a "summary" child chunk for special content.
+    """
+    special_content_child_chunks = []
+
+    if not raw_elements:
+        logger.warning("No raw elements provided for special content processing. Returning empty.")
+        return []
+
+    # Initialize LLM for summarization (using a multimodal model for images)
+    llm_for_summaries = ChatOpenAI(
+        openai_api_key=embedding_api_key,
+        model="gpt-4o-mini", # Using a capable multimodal model for summarization
+        temperature=0.0
+    )
+
+    def _image_to_base64_str(image_path: str) -> str | None:
+        """
+        Converts an image file from a given path to a base64 encoded string.
+        Returns None if the file cannot be opened or processed.
+        """
+        try:
+            with Image.open(image_path) as image:
+                buffered = io.BytesIO()
+                # Use PNG for better quality/transparency, or original format if known
+                image.save(buffered, format="PNG")
+                return base64.b64encode(buffered.getvalue()).decode('utf-8')
+        except FileNotFoundError:
+            logger.error(f"Image file not found at path: {image_path}")
+            return None
+        except Exception as e:
+            logger.error(f"Error converting image {image_path} to base64: {e}")
+            return None
+
+    for element in raw_elements:
+        element_category = element.metadata.get("category")
+        element_text = (element.page_content or "").strip()
+
+        parent_chunk_id = element.metadata.get("parent_chunk_id") or element.metadata.get("document_id")
+
+        summary_content = None
+        raw_special_content_to_store = None
+
+        if element_category == "Table" and element_text:
+            table_html = element.metadata.get("text_as_html")
+            if table_html:
+                raw_special_content_to_store = table_html.encode('utf-8')
+                logger.debug(f"Summarizing table from parent ID {parent_chunk_id}...")
+                try:
+                    response = llm_for_summaries.invoke([
+                        HumanMessage(
+                            content=f"Summarize the following table content concisely, focusing on key data and insights:\n\n{element_text}"
+                        )
+                    ])
+                    summary_content = response.content
+                except Exception as e:
+                    logger.error(f"LLM summarization failed for table (Parent ID: {parent_chunk_id}): {e}")
+                    summary_content = f"Table content summary failed. Original content: {element_text[:500]}..."
+            else:
+                logger.warning(f"Table element (Parent ID: {parent_chunk_id}) found but no HTML content. Summarizing raw text.")
+                raw_special_content_to_store = element_text.encode('utf-8')
+                try:
+                    response = llm_for_summaries.invoke([
+                        HumanMessage(
+                            content=f"Summarize the following table text concisely, focusing on key data and insights:\n\n{element_text}"
+                        )
+                    ])
+                    summary_content = response.content
+                except Exception as e:
+                    logger.error(f"LLM summarization failed for table (Parent ID: {parent_chunk_id}): {e}")
+                    summary_content = f"Table content summary failed. Original content: {element_text[:500]}..."
+
+        elif element_category == "FigureCaption" and element_text:
+            raw_special_content_to_store = element_text.encode('utf-8')
+            logger.debug(f"Summarizing figure caption from parent ID {parent_chunk_id}...")
             try:
-                total_chunk_size_bytes = len(json.dumps(temp_meta_with_full_text).encode("utf-8"))
-            except TypeError:
-                logger.error(f"Failed to JSON serialize metadata for chunk '{base_chunk_id}' during size estimation. Attempting string conversion.")
-                safe_temp_meta = {}
-                for k, v in temp_meta_with_full_text.items():
-                    try:
-                        json.dumps({k: v})
-                        safe_temp_meta[k] = v
-                    except Exception:
-                        safe_temp_meta[k] = str(v)
-                total_chunk_size_bytes = len(json.dumps(safe_temp_meta).encode("utf-8"))
+                response = llm_for_summaries.invoke([
+                    HumanMessage(
+                        content=f"Summarize the following figure caption concisely, highlighting the main point of the figure:\n\n{element_text}"
+                    )
+                ])
+                summary_content = response.content
+            except Exception as e:
+                logger.error(f"LLM summarization failed for figure caption (Parent ID: {parent_chunk_id}): {e}")
+                summary_content = f"Figure caption summary failed. Original content: {element_text[:500]}..."
 
-            if total_chunk_size_bytes > pinecone_metadata_max_bytes:
-                logger.warning(f"Chunk '{base_chunk_id}' (size: {total_chunk_size_bytes} bytes) exceeds Pinecone metadata limit ({pinecone_metadata_max_bytes} bytes). Re-splitting content.")
-                metadata_for_resplitter = sanitized_meta.copy()
-                metadata_for_resplitter.pop("text", None)
-                resplit_docs = _resplit_chunk_for_pinecone_limit(final_content, metadata_for_resplitter, logger)
+        elif element_category == "Image":
+            image_path = element.metadata.get("image_path")
+            image_base64_from_metadata = element.metadata.get("image_base64")
 
-                for sub_idx, sc_doc in enumerate(resplit_docs):
-                    sub_chunk_id = f"{base_chunk_id}-{sub_idx}"
-                    sc_doc.metadata["chunk_id"] = sub_chunk_id
-                    sc_doc.metadata["text"] = sc_doc.page_content
-                    pruned_sub_meta = _shrink_metadata_to_limit(sc_doc.metadata, logger, pinecone_metadata_max_bytes)
-
-                    if pruned_sub_meta.get("text_truncated", False):
-                        logger.critical(f"CRITICAL: Sub-chunk '{sub_chunk_id}' text was truncated even after re-splitting. This indicates a serious issue with metadata or very small chunk size configuration.")
-                        sc_doc.page_content = pruned_sub_meta["text"]
-                    final_section_chunks_for_this_section.append(Document(page_content=sc_doc.page_content, metadata=pruned_sub_meta))
+            base64_image = None
+            if image_path and os.path.exists(image_path):
+                base64_image = _image_to_base64_str(image_path)
+                logger.debug(f"Image element (Parent ID: {parent_chunk_id}) found with path: {image_path}")
+            elif image_base64_from_metadata:
+                base64_image = image_base64_from_metadata
+                logger.debug(f"Image element (Parent ID: {parent_chunk_id}) found with base64 directly in metadata.")
             else:
-                sanitized_meta["text"] = final_content
-                pruned_meta = _shrink_metadata_to_limit(sanitized_meta, logger, pinecone_metadata_max_bytes)
+                logger.warning(f"Image element (Parent ID: {parent_chunk_id}) found but no 'image_path' or 'image_base64' in metadata. Skipping image summarization.")
 
-                if pruned_meta.get("text_truncated", False):
-                   logger.warning(f"Chunk '{base_chunk_id}' text was truncated to fit Pinecone metadata limit.")
-                   final_content = pruned_meta["text"]
+            if base64_image:
+                raw_special_content_to_store = base64_image.encode('utf-8')
+                logger.debug(f"Summarizing image from parent ID {parent_chunk_id}...")
+                try:
+                    # Use multimodal capabilities of gpt-4o-mini
+                    response = llm_for_summaries.invoke([
+                        HumanMessage(
+                            content=[
+                                {"type": "text", "text": "Describe this image in detail, focusing on elements relevant to a document's content. Be concise and factual."},
+                                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}}
+                            ]
+                        )
+                    ])
+                    summary_content = response.content
+                except Exception as e:
+                    logger.error(f"LLM summarization failed for image (Parent ID: {parent_chunk_id}): {e}")
+                    summary_content = f"Image description failed. Original image path: {image_path or 'N/A'}."
+            else:
+                logger.warning(f"Could not get base64 for image element (Parent ID: {parent_chunk_id}). Skipping summarization.")
 
-                final_section_chunks_for_this_section.append(Document(page_content=final_content, metadata=pruned_meta))
 
-        # Extend the overall list with chunks generated for THIS section
-        final_semantic_chunks.extend(final_section_chunks_for_this_section)
+        if summary_content:
+            special_content_id = f"{parent_chunk_id}_special_{hashlib.sha256(raw_special_content_to_store).hexdigest()[:8]}"
+            parent_doc_store.mset([(special_content_id, raw_special_content_to_store)])
+            logger.debug(f"Stored raw special content with ID: {special_content_id}")
 
-    logger.info(f"Generated {len(final_semantic_chunks)} final semantic chunks for document '{file_name}'.")
-    return final_semantic_chunks
+            child_metadata = element.metadata.copy()
+            child_metadata["parent_chunk_id"] = parent_chunk_id
+            child_metadata["special_content_id"] = special_content_id
+            child_metadata["category"] = f"summary_{element_category.lower()}"
+            child_metadata["text"] = summary_content
+
+            # Propagate section_id and section_heading if available from Unstructured (inherited from parent_doc)
+            if "section_id" in element.metadata:
+                child_metadata["section_id"] = element.metadata["section_id"]
+            if "section_heading" in element.metadata:
+                child_metadata["section_heading"] = element.metadata["section_heading"]
+
+            # For special content, we don't have a direct "chunk_index_in_section" from a splitter.
+            # We can assign a unique index or leave it out if not strictly required by the plugin for special types.
+            # For now, we'll assign a placeholder or derive it if a logical order exists.
+            # If the plugin strictly needs it for *all* chunks, we might need a more complex indexing.
+            # For simplicity, we'll use a unique identifier based on hash, as its position isn't sequential text.
+            child_metadata["chunk_index_in_section"] = f"special_{hashlib.sha256(summary_content.encode('utf-8')).hexdigest()[:8]}"
+
+
+            child_metadata["child_chunk_id"] = deterministic_chunk_id(
+                parent_chunk_id,
+                summary_content,
+                child_metadata.get("page_number", ""),
+                child_metadata.get("start_index", "")
+            )
+
+            sanitized_pruned_metadata = _shrink_metadata_to_limit(
+                _canonicalize_and_filter_metadata(
+                    child_metadata,
+                    parsed_global_custom_metadata,
+                    document_specific_metadata_map.get(child_metadata.get('file_name', ''), {}),
+                    logger
+                ),
+                logger,
+                pinecone_metadata_max_bytes
+            )
+
+            if sanitized_pruned_metadata.get("text_truncated", False):
+                summary_content = sanitized_pruned_metadata["text"]
+                logger.warning(f"Summary chunk (ID: {sanitized_pruned_metadata.get('child_chunk_id', 'N/A')}) text truncated during final metadata shrink.")
+
+            special_content_child_chunks.append(Document(page_content=summary_content, metadata=sanitized_pruned_metadata))
+            logger.debug(f"Generated summary child chunk for {element_category} (Parent ID: {parent_chunk_id}).")
+
+    logger.info(f"Generated {len(special_content_child_chunks)} summary child chunks for special content.")
+    return special_content_child_chunks
 
 # -------- API Connection Test Function --------
 def test_api_connections(pinecone_api_key: str, embedding_api_key: str, logger: logging.Logger):
@@ -1401,7 +1137,7 @@ def manage_documents_ui(pinecone_api_key: str, pinecone_index_name: str, namespa
                     unique_doc_names = set()
                     for m in matches:
                         md = m.get("metadata") or {}
-                        fn = md.get("file_name")
+                        fn = md.get("file_name") # This will now be lowercase
                         if not fn:
                             fn = md.get("document_id")
                         if fn:
@@ -1423,6 +1159,7 @@ def manage_documents_ui(pinecone_api_key: str, pinecone_index_name: str, namespa
 
     search_query = st.text_input("Filter loaded documents by name:", key="doc_search_input", help="Type to filter the list of loaded documents.", value="")
 
+    # Filter against the already normalized document names
     filtered_document_names = [name for name in all_document_names if search_query.lower() in name.lower()]
 
     if filtered_document_names:
@@ -1448,7 +1185,9 @@ def manage_documents_ui(pinecone_api_key: str, pinecone_index_name: str, namespa
             st.info("Displaying metadata from a single representative chunk. Full document metadata may vary across chunks.")
             if index:
                 try:
-                    query_filter = {"file_name": st.session_state.metadata_display_doc_name}
+                    # Use the normalized display name for the filter
+                    normalized_display_name_for_filter = st.session_state.metadata_display_doc_name.lower()
+                    query_filter = {"file_name": normalized_display_name_for_filter}
                     # Heuristic to check if it's likely a document_id (SHA256 hash)
                     if "_" not in st.session_state.metadata_display_doc_name and len(st.session_state.metadata_display_doc_name) == 64 and all(c in '0123456789abcdef' for c in st.session_state.metadata_display_doc_name.lower()):
                          query_filter = {"document_id": st.session_state.metadata_display_doc_name}
@@ -1488,9 +1227,10 @@ def manage_documents_ui(pinecone_api_key: str, pinecone_index_name: str, namespa
                 st.session_state.file_to_delete_staged = ""
                 logger.info(f"Deletion staged for specific document ID: {doc_name_or_id_to_delete}")
             else:
-                st.session_state.file_to_delete_staged = doc_name_or_id_to_delete
+                # Normalize user input for file_name deletion
+                st.session_state.file_to_delete_staged = doc_name_or_id_to_delete.lower()
                 st.session_state.docid_to_delete_staged = ""
-                logger.info(f"Deletion staged for specific file name: {doc_name_or_id_to_delete}")
+                logger.info(f"Deletion staged for specific file name: {doc_name_or_id_to_delete.lower()}")
             st.session_state.delete_pending = True
             st.rerun()
         else:
@@ -1576,15 +1316,17 @@ def manage_documents_ui(pinecone_api_key: str, pinecone_index_name: str, namespa
                     deleted_summaries = []
 
                     if file_to_delete:
+                        # file_to_delete is already normalized if it came from direct input or loaded names
                         logger.info(f"Attempting to delete records with file_name == '{file_to_delete}' in namespace '{namespace or '__default__'}'.")
                         index.delete(filter={"file_name": file_to_delete}, namespace=(namespace or None))
                         deleted_summaries.append(f"Deleted records with file_name == '{file_to_delete}'")
                         logger.info(f"Delete request sent for file_name '{file_to_delete}'.")
 
                     if docid_to_delete:
-                        logger.info(f"Attempting to delete record with document_id == '{docid_to_delete}' in namespace '{namespace or '__default__'}'.")
-                        index.delete(ids=[docid_to_delete], namespace=(namespace or None))
-                        deleted_summaries.append(f"Deleted record with document_id == '{docid_to_delete}'")
+                        # Assuming docid_to_delete is the document_id (hash of the original file)
+                        logger.info(f"Attempting to delete records with document_id == '{docid_to_delete}' in namespace '{namespace or '__default__'}'.")
+                        index.delete(filter={"document_id": docid_to_delete}, namespace=(namespace or None))
+                        deleted_summaries.append(f"Deleted records with document_id == '{docid_to_delete}'")
                         logger.info(f"Delete request sent for document_id '{docid_to_delete}'.")
 
                     st.success("Deletion successfully initiated:")
@@ -1852,74 +1594,73 @@ def main():
         )
 
         with st.expander("⚙️ Advanced Chunking Settings", expanded=False):
-            heading_detection_confidence_threshold_ui = st.slider(
-                "Heading Detection Sensitivity",
-                min_value=0.0,
-                max_value=1.0,
-                value=float(os.environ.get("HEADING_DETECTION_CONFIDENCE_THRESHOLD", DEFAULT_SETTINGS["HEADING_DETECTION_CONFIDENCE_THRESHOLD"])),
-                step=0.01,
-                format="%.2f",
+            st.markdown("---")
+            st.subheader("Semantic Chunking Parameters")
+            semantic_chunker_threshold_type_options = ["percentile", "standard_deviation", "interquartile", "gradient"]
+            current_semantic_threshold_type = os.environ.get("SEMANTIC_CHUNKER_THRESHOLD_TYPE", "percentile")
+            default_semantic_threshold_type_index = semantic_chunker_threshold_type_options.index(current_semantic_threshold_type) if current_semantic_threshold_type in semantic_chunker_threshold_type_options else 0
+            semantic_chunker_threshold_type = st.selectbox(
+                "Semantic Split Threshold Type",
+                options=semantic_chunker_threshold_type_options,
+                index=default_semantic_threshold_type_index,
                 help=(
-                    "This controls how aggressively the system tries to identify headings and subheadings within your document. "
-                    "**Higher values (e.g., 0.80-1.00)** make the detection more strict, meaning only very clear headings will be recognized. "
-                    "This can result in fewer, larger sections. "
-                    "**Lower values (e.g., 0.00-0.50)** make the detection more lenient, potentially identifying more text segments as headings. "
-                    "This can lead to more, smaller sections. "
-                    "Adjust this if your document's structure isn't being recognized correctly, or if you want more/less granular sections based on headings. "
-                    "Default: 0.65 (a balanced approach)."
+                    "Determines how semantic breakpoints are identified. "
+                    "'percentile': Splits at distances greater than a certain percentile of all distances (default 95). "
+                    "'standard_deviation': Splits at distances greater than X standard deviations from the mean (default 3). "
+                    "'interquartile': Uses interquartile range for splitting (default 1.5). "
+                    "'gradient': Applies anomaly detection on gradient array (default 95)."
                 ),
-                key="config_heading_detection_confidence_threshold"
+                key="config_semantic_chunker_threshold_type"
             )
 
-            min_chunks_per_section_for_merge_ui = st.number_input(
-                "Min Content Elements Per Section (for merging)",
-                min_value=1,
-                value=int(os.environ.get("MIN_CHUNKS_PER_SECTION_FOR_MERGE", DEFAULT_SETTINGS["MIN_CHUNKS_PER_SECTION_FOR_MERGE"])),
-                step=1,
+            # Adjust min/max/value/step based on the selected type for better UX
+            threshold_amount_min = 0.0
+            threshold_amount_max = 100.0
+            threshold_amount_value = 95.0
+            threshold_amount_step = 0.1
+
+            if semantic_chunker_threshold_type == "standard_deviation":
+                threshold_amount_min = 0.1
+                threshold_amount_max = 10.0
+                threshold_amount_value = 3.0
+                threshold_amount_step = 0.1
+            elif semantic_chunker_threshold_type == "interquartile":
+                threshold_amount_min = 0.1
+                threshold_amount_max = 5.0
+                threshold_amount_value = 1.5
+                threshold_amount_step = 0.1
+            elif semantic_chunker_threshold_type == "gradient":
+                threshold_amount_min = 0.0
+                threshold_amount_max = 100.0
+                threshold_amount_value = 95.0
+                threshold_amount_step = 0.1
+
+            semantic_chunker_threshold_amount = st.slider(
+                "Semantic Split Threshold Amount",
+                min_value=threshold_amount_min,
+                max_value=threshold_amount_max,
+                value=float(os.environ.get("SEMANTIC_CHUNKER_THRESHOLD_AMOUNT", str(threshold_amount_value))),
+                step=threshold_amount_step,
+                format="%.1f",
                 help=(
-                    "After identifying headings, the system groups related content into sections. "
-                    "This setting ensures that each section contains a minimum number of 'content elements' (like paragraphs or list items). "
-                    "If a detected section has fewer content elements than this value, it will be merged with a neighboring section. "
-                    "**Increase this value** if you find sections are too short or fragmented. "
-                    "**Decrease this value** if you want to preserve very small, distinct sections. "
-                    "Default: 2 (ensures sections have at least two meaningful content parts)."
+                    f"The specific value for the selected threshold type. "
+                    f"For '{semantic_chunker_threshold_type}', a higher value means fewer, larger chunks (more strict splitting)."
                 ),
-                key="config_min_chunks_per_section_for_merge"
+                key="config_semantic_chunker_threshold_amount"
             )
 
-            sentence_split_threshold_chars_ui = st.number_input(
-                "Auto-Split Long Paragraphs (Characters)",
-                min_value=100,
-                value=int(os.environ.get("SENTENCE_SPLIT_THRESHOLD_CHARS", DEFAULT_SETTINGS["SENTENCE_SPLIT_THRESHOLD_CHARS"])),
-                step=50,
-                help=(
-                    "For very long paragraphs or text blocks that aren't clearly structured by headings, "
-                    "this setting tells the system to automatically split them into smaller parts based on sentence boundaries. "
-                    "If a single block of text exceeds this character length, it will be broken down. "
-                    "This helps ensure that individual chunks aren't excessively long, which can be beneficial for embedding quality and retrieval. "
-                    "**Lower this value** to split long paragraphs more aggressively. "
-                    "**Raise this value** to keep longer paragraphs intact. "
-                    "Default: 300 (splits paragraphs longer than 300 characters into sentences)."
-                ),
-                key="config_sentence_split_threshold_chars"
-            )
-            
-            min_chunk_length_ui = st.number_input(
-                "Minimum Final Chunk Length (Characters)",
+            min_child_chunk_length_ui = st.number_input(
+                "Minimum Semantic Child Chunk Length (characters)",
                 min_value=1,
-                value=int(os.environ.get("MIN_CHUNK_LENGTH", DEFAULT_SETTINGS["MIN_CHUNK_LENGTH"])),
+                value=int(os.environ.get("MIN_CHILD_CHUNK_LENGTH", "100")), # Default to 100 chars
                 step=10,
                 help=(
-                    "This is the absolute minimum character length for any final chunk that gets sent to Pinecone. "
-                    "If a chunk ends up shorter than this value (e.g., after splitting or filtering), "
-                    "the system will try to merge it with an adjacent chunk to create a more meaningful piece of information. "
-                    "This prevents very small, potentially uninformative, chunks from being embedded. "
-                    "**Increase this value** if you want to ensure all chunks are substantial. "
-                    "**Decrease this value** if you need to retain very short, critical pieces of information. "
-                    "Default: 100 (chunks shorter than 100 characters will be merged if possible)."
+                    "The absolute minimum character length for any semantic child chunk. "
+                    "Chunks shorter than this will be skipped. This helps ensure embeddable chunks are meaningful."
                 ),
-                key="config_min_chunk_length"
+                key="config_min_child_chunk_length"
             )
+
         # Advanced Logging Settings
         with st.expander("Advanced Logging Settings", expanded=False):
             logging_level_options = ["DEBUG", "INFO", "WARNING", "ERROR"]
@@ -1969,11 +1710,11 @@ def main():
             "MIN_GENERIC_CONTENT_LENGTH": str(min_generic_content_length_ui),
             "ENABLE_NER_FILTERING": str(enable_ner_filtering),
             "UNSTRUCTURED_STRATEGY": unstructured_strategy,
-            "HEADING_DETECTION_CONFIDENCE_THRESHOLD": str(heading_detection_confidence_threshold_ui),
-            "MIN_CHUNKS_PER_SECTION_FOR_MERGE": str(min_chunks_per_section_for_merge_ui),
-            "SENTENCE_SPLIT_THRESHOLD_CHARS": str(sentence_split_threshold_chars_ui),
-            "MIN_CHUNK_LENGTH": str(min_chunk_length_ui),
+            "SEMANTIC_CHUNKER_THRESHOLD_TYPE": semantic_chunker_threshold_type,
+            "SEMANTIC_CHUNKER_THRESHOLD_AMOUNT": str(semantic_chunker_threshold_amount),
+            "MIN_CHILD_CHUNK_LENGTH": str(min_child_chunk_length_ui),
         }
+
         with open(".env", "w") as f:
             for k, v in to_save.items():
                 f.write(f"{k}={v}\n")
@@ -1999,10 +1740,6 @@ def main():
 
             st.session_state.dynamic_metadata_fields = [{"key": "", "value": ""}]
             defaults["CUSTOM_METADATA"] = json.dumps(st.session_state.dynamic_metadata_fields)
-            defaults["HEADING_DETECTION_CONFIDENCE_THRESHOLD"] = DEFAULT_SETTINGS["HEADING_DETECTION_CONFIDENCE_THRESHOLD"]
-            defaults["MIN_CHUNKS_PER_SECTION_FOR_MERGE"] = DEFAULT_SETTINGS["MIN_CHUNKS_PER_SECTION_FOR_MERGE"]
-            defaults["SENTENCE_SPLIT_THRESHOLD_CHARS"] = DEFAULT_SETTINGS["SENTENCE_SPLIT_THRESHOLD_CHARS"]
-            defaults["MIN_CHUNK_LENGTH"] = DEFAULT_SETTINGS["MIN_CHUNK_LENGTH"]
 
             with open(".env", "w") as f:
                 for k, v in defaults.items():
@@ -2035,7 +1772,7 @@ def main():
             field['value'] = st.text_input(f"Value {i+1}", value=field['value'], key=f"meta_value_{i}", label_visibility="collapsed")
         with cols[2]:
             if len(st.session_state.dynamic_metadata_fields) > 1 or (len(st.session_state.dynamic_metadata_fields) == 1 and i == 0 and (field['key'] != "" or field['value'] != "")):
-                if st.button("ðŸ—‘ï¸", key=f"remove_meta_{i}", help="Remove this custom field"):
+                if st.button("🗑️", key=f"remove_meta_{i}", help="Remove this custom field"):
                     st.session_state.dynamic_metadata_fields.pop(i)
                     st.rerun()
             else:
@@ -2059,10 +1796,10 @@ def main():
         "Select documents to upload",
         type=[
             "pdf", "txt", "md", "docx", "xlsx", "pptx", "csv", "html", "xml",
-            "eml", "epub", "rtf", "odt", "org", "rst", "tsv"
+            "eml", "epub", "rtf", "odt", "org", "rst", "tsv", "jpg", "jpeg", "png", "gif", "bmp", "tiff", "webp"
         ],
         accept_multiple_files=True,
-        help="Supported file types include common document, spreadsheet, and presentation formats."
+        help="Supported file types include common document, spreadsheet, presentation, and image formats."
     )
 
     # Display uploaded file names for better user experience
@@ -2125,7 +1862,7 @@ def main():
                     if 'file_name' not in df.columns:
                         raise ValueError("CSV metadata file must contain a 'file_name' column.")
                     for _, row in df.iterrows():
-                        file_name_val = row['file_name']
+                        file_name_val = str(row['file_name']).lower() # Normalize file_name from CSV
                         doc_md = {}
                         for k, v in row.drop('file_name').items():
                             if k not in RESERVED_METADATA_KEYS:
@@ -2145,7 +1882,7 @@ def main():
                     for entry in json_data:
                         if 'file_name' not in entry:
                             raise ValueError("Each object in JSON metadata array must contain a 'file_name' key.")
-                        file_name_val = entry['file_name']
+                        file_name_val = str(entry['file_name']).lower() # Normalize file_name from JSON
                         cleaned_entry = {}
                         for k, v in entry.items():
                             if k == 'file_name': continue
@@ -2181,9 +1918,10 @@ def main():
         plan_summary_placeholder = st.empty()
 
         for uploaded_file in uploaded_files:
-            file_name = uploaded_file.name
+            original_file_name = uploaded_file.name
+            normalized_file_name = original_file_name.lower() # Normalize file name
             file_bytes = uploaded_file.getvalue()
-            document_id = deterministic_document_id(file_name, file_bytes)
+            document_id = deterministic_document_id(normalized_file_name, file_bytes)
 
             status_message = ""
             should_process = True
@@ -2191,32 +1929,33 @@ def main():
             if pc and pc.has_index(pinecone_index_name):
                 idx = pc.Index(pinecone_index_name)
                 if overwrite_existing_docs:
-                    status_message = f"🔄 '{file_name}': Overwrite enabled. Existing records will be removed."
-                    logger.info(f"Plan: Overwrite enabled for '{file_name}'.")
+                    status_message = f"🔄 '{original_file_name}': Overwrite enabled. Existing records will be removed."
+                    logger.info(f"Plan: Overwrite enabled for '{original_file_name}'.")
                 else:
                     try:
                         dummy = [0.0] * int(embedding_dimension)
-                        q = idx.query(vector=dummy, top_k=1, filter={"file_name": file_name}, include_values=False, namespace=(namespace or None))
+                        # Use normalized_file_name for the existence check filter
+                        q = idx.query(vector=dummy, top_k=1, filter={"file_name": normalized_file_name}, include_values=False, namespace=(namespace or None))
                         matches = getattr(q, "matches", None) or q.get("matches", [])
                         if matches:
                             should_process = False
-                            status_message = f"⏩ '{file_name}': SKIPPED (already present, overwrite disabled)."
-                            logger.info(f"Plan: Skipped '{file_name}': already present and overwrite disabled.")
+                            status_message = f"⏩ '{original_file_name}': SKIPPED (already present, overwrite disabled)."
+                            logger.info(f"Plan: Skipped '{original_file_name}': already present and overwrite disabled.")
                         else:
-                            status_message = f"📄 '{file_name}': Will be processed (not found, or overwrite enabled)."
-                            logger.info(f"Plan: '{file_name}' will be processed.")
+                            status_message = f"📄 '{original_file_name}': Will be processed (not found, or overwrite enabled)."
+                            logger.info(f"Plan: '{original_file_name}' will be processed.")
                     except Exception as e:
-                        logger.exception(f"Plan: Presence check for '{file_name}' failed.")
-                        status_message = f"⚠️ '{file_name}': Presence check failed ({e}). Will attempt to process."
+                        logger.exception(f"Plan: Presence check for '{original_file_name}' failed.")
+                        status_message = f"⚠️ '{original_file_name}': Presence check failed ({e}). Will attempt to process."
                         should_process = True
             else:
-                status_message = f"📄 '{file_name}': Will be processed (Pinecone index not yet available or provided)."
-                logger.info(f"Plan: '{file_name}' will be processed. Pinecone client not ready.")
+                status_message = f"📄 '{original_file_name}': Will be processed (Pinecone index not yet available or provided)."
+                logger.info(f"Plan: '{original_file_name}' will be processed. Pinecone client not ready.")
 
             plan_summary_messages.append(status_message)
 
             if should_process:
-                files_to_process_plan.append((uploaded_file, document_id))
+                files_to_process_plan.append((uploaded_file, document_id, normalized_file_name))
 
             with plan_summary_placeholder.container():
                 for msg in plan_summary_messages:
@@ -2251,116 +1990,118 @@ def main():
             logger.error("Pinecone index not available for processing loop. Aborting.")
             return
 
-        for file_idx, (uploaded_file, document_id) in enumerate(files_to_process_plan):
-            file_name = uploaded_file.name
-            with st.status(f"Processing document: **{file_name}** ({file_idx + 1}/{total_files_to_process})", expanded=True) as status_container:
+        for file_idx, (uploaded_file, document_id, normalized_file_name) in enumerate(files_to_process_plan):
+            original_file_name = uploaded_file.name # Keep original for display
+            with st.status(f"Processing document: **{original_file_name}** ({file_idx + 1}/{total_files_to_process})", expanded=True) as status_container:
                 temp_dir = None
                 try:
-                    status_container.update(label=f"Processing document: **{file_name}** - Saving to temporary storage...", state="running")
+                    status_container.update(label=f"Processing document: **{original_file_name}** - Saving to temporary storage...", state="running")
                     file_path, temp_dir, file_bytes = save_uploaded_file_to_temp(uploaded_file)
                     if not file_path:
                         raise Exception("Failed to save uploaded file.")
 
                     # Delete existing records if overwrite is enabled
                     if overwrite_existing_docs:
-                        status_container.update(label=f"Processing document: **{file_name}** - Deleting existing records...", state="running")
+                        status_container.update(label=f"Processing document: **{original_file_name}** - Deleting existing records...", state="running")
                         try:
-                            index.delete(filter={"file_name": file_name}, namespace=(namespace or None))
-                            status_container.write(f"✅ Existing records for '{file_name}' removed.")
-                            logger.info(f"Existing records for '{file_name}' deleted from Pinecone during processing.")
+                            # Use the normalized_file_name for deletion filter
+                            logger.info(f"Attempting to delete records with document_id == '{document_id}' in namespace '{namespace or '__default__'}'.")
+                            index.delete(filter={"document_id": document_id}, namespace=(namespace or None))
+                            index.delete(filter={"file_name": normalized_file_name}, namespace=(namespace or None))
+                            status_container.write(f"✅ Existing records for '{original_file_name}' (Document ID: {document_id}, Normalized File Name: {normalized_file_name}) removed.")
+                            logger.info(f"Existing records for '{original_file_name}' deleted from Pinecone during processing.")
                         except Exception as e:
-                            status_container.write(f"⚠️ Failed to delete existing records for '{file_name}': {e}")
-                            logger.exception(f"Failed to delete existing records for '{file_name}' during processing.")
+                            status_container.write(f"⚠️ Failed to delete existing records for '{original_file_name}': {e}")
+                            logger.exception(f"Failed to delete existing records for '{original_file_name}' during processing.")
 
-                    status_container.update(label=f"Processing document: **{file_name}** - Loading content...", state="running")
+                    status_container.update(label=f"Processing document: **{original_file_name}** - Loading content...", state="running")
                     loader = UnstructuredLoader(file_path, strategy=unstructured_strategy)
-                    docs = list(loader.lazy_load())
-                    status_container.write(f"Loaded {len(docs)} raw parts using '{unstructured_strategy}' strategy.")
-                    logger.debug(f"UnstructuredLoader loaded {len(docs)} raw parts for '{file_name}' with strategy '{unstructured_strategy}'.")
+                    raw_elements = list(loader.lazy_load())
+                    status_container.write(f"Loaded {len(raw_elements)} raw parts using '{unstructured_strategy}' strategy.")
+                    logger.debug(f"UnstructuredLoader loaded {len(raw_elements)} raw parts for '{original_file_name}' with strategy '{unstructured_strategy}'.")
 
-                    meaningful_chunks = []
-                    status_container.update(label=f"Processing document: **{file_name}** - Filtering content...", state="running")
-                    for d in docs:
-                        text = (d.page_content or "").strip()
-                        category = d.metadata.get("category")
-                        keep = False
+                    for element in raw_elements:
+                        element.metadata["document_id"] = document_id
+                        element.metadata["file_name"] = normalized_file_name # Store normalized name
+                        element.metadata["original_file_path"] = file_path
 
-                        if not enable_filtering:
-                            if text: keep = True
-                            else: continue
-                        else:
-                            if text:
-                                if any(keyword in text.lower() for keyword in whitelisted_keywords_set):
-                                    keep = True
-                                elif category in STRUCTURAL_CUES_AND_CRITICAL_CONCISE_CONTENT:
-                                    keep = True
-                                elif len(text) >= min_generic_content_length_ui:
-                                    keep = True
-                                elif enable_ner_filtering and nlp is not None:
-                                    doc_spacy = nlp(text)
-                                    if doc_spacy.ents:
-                                        keep = True
-                                        logger.debug(f"Kept short generic chunk due to NER: '{text[:50]}...' Entities: {[ent.text for ent in doc_spacy.ents]}")
+                    status_container.update(label=f"Processing document: **{original_file_name}** - Creating parent documents...", state="running")
+                    parent_documents, parent_doc_store = _create_parent_documents(raw_elements, logger)
+                    status_container.write(f"✅ Created {len(parent_documents)} parent documents.")
+                    logger.info(f"'{original_file_name}': Parent document creation complete.")
 
-                        if keep:
-                            d.metadata["document_id"] = document_id
-                            d.metadata["file_name"] = file_name
-                            d.metadata["original_file_path"] = file_path
-                            meaningful_chunks.append(d)
-                        else:
-                            logger.debug(f"Filtered out chunk from '{file_name}' (category: {category}, length: {len(text)}) due to filtering rules.")
-
-                    status_container.write(f"Filtered to {len(meaningful_chunks)} meaningful parts.")
-                    logger.info(f"'{file_name}': {len(docs)} raw parts, {len(meaningful_chunks)} meaningful parts kept after filtering.")
-
-                    if not meaningful_chunks:
-                        status_container.write(f"⚠️ No meaningful content found for '{file_name}' after filtering. This document will not be embedded.")
-                        logger.warning(f"No meaningful content for '{file_name}' after filtering.")
-                        status_container.update(label=f"Document: **{file_name}** - No meaningful content!", state="warning", expanded=False)
+                    if not parent_documents:
+                        status_container.write(f"⚠️ No parent documents could be created for '{original_file_name}'. This document will not be embedded.")
+                        logger.warning(f"No parent documents for '{original_file_name}'. Aborting processing for this file.")
+                        status_container.update(label=f"Document: **{original_file_name}** - No content for parent documents!", state="warning", expanded=False)
                         continue
 
-                    # Layer 1: Adaptive Document Structure Analysis
-                    status_container.update(label=f"Processing document: **{file_name}** - Analyzing document structure (Layer 1)...", state="running")
-                    doc_context = _analyze_document_structure(meaningful_chunks, logger)
-                    status_container.write(f"✅ Layer 1: Document structure analyzed. Inferred type: '{doc_context.get('inferred_document_type', 'N/A')}'.")
-                    logger.info(f"'{file_name}': Document structure analysis complete. Context: {doc_context}")
-
-                    # Layer 2: Universal Heading Detection & Hierarchy Extraction
-                    status_container.update(label=f"Processing document: **{file_name}** - Extracting document outline (Layer 2)...", state="running")
-                    document_outline = _extract_document_outline(
-                        meaningful_chunks,
-                        doc_context,
-                        heading_detection_confidence_threshold_ui, # Pass new UI param
-                        min_chunks_per_section_for_merge_ui,      # Pass new UI param
-                        logger
+                    status_container.update(label=f"Processing document: **{original_file_name}** - Filtering parent document content...", state="running")
+                    filtered_parent_documents = _filter_parent_content(
+                        parent_documents=parent_documents,
+                        enable_filtering=enable_filtering,
+                        whitelisted_keywords_set=whitelisted_keywords_set,
+                        min_generic_content_length=min_generic_content_length_ui,
+                        enable_ner_filtering=enable_ner_filtering,
+                        nlp=nlp,
+                        logger=logger
                     )
-                    status_container.write(f"✅ Layer 2: Document outline extracted. Detected {len(document_outline)} sections.")
-                    logger.info(f"'{file_name}': Document outline extracted. Outline: {document_outline}")
+                    status_container.write(f"✅ Filtered to {len(filtered_parent_documents)} meaningful parent documents.")
+                    logger.info(f"'{original_file_name}': Parent document filtering complete.")
 
-                    # Layer 3: Adaptive Hierarchical Semantic Chunking
-                    status_container.update(label=f"Processing document: **{file_name}** - Generating semantic chunks (Layer 3)...", state="running")
-                    file_specific_final_chunks = _generate_semantic_chunks(
-                        meaningful_chunks=meaningful_chunks,
-                        document_outline=document_outline,
-                        user_chunk_size=chunk_size,
-                        user_chunk_overlap=chunk_overlap,
+                    if not filtered_parent_documents:
+                        status_container.write(f"⚠️ No meaningful content found for '{original_file_name}' after filtering parent documents. This document will not be embedded.")
+                        logger.warning(f"No meaningful content for '{original_file_name}' after filtering parent documents. Aborting processing for this file.")
+                        status_container.update(label=f"Document: **{original_file_name}** - No meaningful content after filtering!", state="warning", expanded=False)
+                        continue
+
+                    status_container.update(label=f"Processing document: **{original_file_name}** - Summarizing special content (tables, figures, images)...", state="running")
+                    special_content_child_chunks = _process_special_elements(
+                        raw_elements=raw_elements,
+                        parent_doc_store=parent_doc_store,
+                        embedding_model_name=embedding_model_name,
+                        embedding_api_key=embedding_api_key,
+                        embedding_dimension=int(embedding_dimension),
                         pinecone_metadata_max_bytes=PINECONE_METADATA_MAX_BYTES,
                         parsed_global_custom_metadata=parsed_global_custom_metadata,
                         document_specific_metadata_map=document_specific_metadata_map,
-                        document_id=document_id,
-                        file_name=file_name,
-                        sentence_split_threshold_chars=sentence_split_threshold_chars_ui,
-                        min_chunk_length=min_chunk_length_ui,
                         logger=logger
                     )
-                    status_container.write(f"✅ Layer 3: Final semantic chunks generated: {len(file_specific_final_chunks)} chunks.")
-                    logger.info(f"'{file_name}': Generated {len(file_specific_final_chunks)} final semantic chunks.")
+                    status_container.write(f"✅ Generated {len(special_content_child_chunks)} summary child chunks for special content.")
+                    logger.info(f"'{original_file_name}': Special content summarization complete.")
+
+                    status_container.update(label=f"Processing document: **{original_file_name}** - Generating semantic child chunks...", state="running")
+                    child_chunks = _generate_child_chunks(
+                        filtered_parent_documents=filtered_parent_documents,
+                        embedding_model_name=embedding_model_name,
+                        embedding_api_key=embedding_api_key,
+                        embedding_dimension=int(embedding_dimension),
+                        pinecone_metadata_max_bytes=PINECONE_METADATA_MAX_BYTES,
+                        parsed_global_custom_metadata=parsed_global_custom_metadata,
+                        document_specific_metadata_map=document_specific_metadata_map,
+                        logger=logger,
+                        semantic_chunker_threshold_type=semantic_chunker_threshold_type,
+                        semantic_chunker_threshold_amount=semantic_chunker_threshold_amount,
+                        min_child_chunk_size=min_child_chunk_length_ui,
+                        configured_chunk_size=chunk_size, # Pass user-configured chunk size
+                        configured_chunk_overlap=chunk_overlap, # Pass user-configured chunk overlap
+                    )
+                    status_container.write(f"✅ Generated {len(child_chunks)} semantic child chunks.")
+                    logger.info(f"'{original_file_name}': Child chunk generation complete.")
+
+                    if not child_chunks and not special_content_child_chunks:
+                        status_container.write(f"⚠️ No embeddable chunks (semantic or special) could be generated for '{original_file_name}'. This document will not be embedded.")
+                        logger.warning(f"No embeddable chunks for '{original_file_name}'. Aborting processing for this file.")
+                        status_container.update(label=f"Document: **{original_file_name}** - No embeddable chunks!", state="warning", expanded=False)
+                        continue
+
+                    all_embeddable_child_chunks = child_chunks + special_content_child_chunks
 
                     # Embedding and Upserting for the current file's chunks
-                    status_container.update(label=f"Processing document: **{file_name}** - Generating embeddings...", state="running")
+                    status_container.update(label=f"Processing document: **{original_file_name}** - Generating embeddings...", state="running")
                     embed_model = OpenAIEmbeddings(openai_api_key=embedding_api_key, model=embedding_model_name, dimensions=int(embedding_dimension))
 
-                    file_texts_to_embed = [c.page_content for c in file_specific_final_chunks]
+                    file_texts_to_embed = [c.page_content for c in all_embeddable_child_chunks]
                     file_vectors = []
                     current_batch_texts = []
                     current_batch_tokens = 0
@@ -2372,7 +2113,7 @@ def main():
                            (len(current_batch_texts) >= OPENAI_MAX_TEXTS_PER_EMBEDDING_REQUEST):
 
                             if current_batch_texts:
-                                logger.debug(f"Embedding batch of {len(current_batch_texts)} texts ({current_batch_tokens} tokens) for '{file_name}'.")
+                                logger.debug(f"Embedding batch of {len(current_batch_texts)} texts ({current_batch_tokens} tokens) for '{original_file_name}'.")
                                 batch_vectors = embed_model.embed_documents(current_batch_texts)
                                 file_vectors.extend(batch_vectors)
 
@@ -2382,69 +2123,61 @@ def main():
                             current_batch_texts.append(text)
                             current_batch_tokens += text_tokens
 
-                        status_container.write(f"Generating embeddings for '{file_name}': {i+1}/{len(file_texts_to_embed)} chunks.")
+                        status_container.write(f"Generating embeddings for '{original_file_name}': {i+1}/{len(file_texts_to_embed)} chunks.")
 
                     if current_batch_texts:
-                        logger.debug(f"Embedding final batch of {len(current_batch_texts)} texts ({current_batch_tokens} tokens) for '{file_name}'.")
+                        logger.debug(f"Embedding final batch of {len(current_batch_texts)} texts ({current_batch_tokens} tokens) for '{original_file_name}'.")
                         batch_vectors = embed_model.embed_documents(current_batch_texts)
                         file_vectors.extend(batch_vectors)
 
-                    status_container.write(f"Generated {len(file_vectors)} embeddings for '{file_name}'.")
-                    logger.info(f"Generated {len(file_vectors)} embeddings for '{file_name}'.")
+                    status_container.write(f"Generated {len(file_vectors)} embeddings for '{original_file_name}'.")
+                    logger.info(f"Generated {len(file_vectors)} embeddings for '{original_file_name}'.")
 
-                    if len(file_vectors) != len(file_specific_final_chunks):
-                        raise ValueError(f"Mismatch: Expected {len(file_specific_final_chunks)} embeddings but got {len(file_vectors)} for '{file_name}'.")
+                    if len(file_vectors) != len(all_embeddable_child_chunks):
+                        raise ValueError(f"Mismatch: Expected {len(all_embeddable_child_chunks)} embeddings but got {len(file_vectors)} for '{original_file_name}'.")
 
                     file_records = []
-                    for c, vec in zip(file_specific_final_chunks, file_vectors):
-                        # The metadata 'c.metadata' should already be clean and pruned from Layer 3.
-                        # This loop acts as a final safeguard.
-                        
-                        # Ensure chunk_id is present (it should be from Layer 3)
-                        chunk_id = c.metadata.get("chunk_id")
+                    for c, vec in zip(all_embeddable_child_chunks, file_vectors):
+                        chunk_id = c.metadata.get("child_chunk_id")
                         if not chunk_id:
-                            # Fallback if somehow chunk_id is missing (should not happen with Layer 3 changes)
                             chunk_id = deterministic_chunk_id(document_id, c.page_content or "", c.metadata.get("page_number", ""), c.metadata.get("start_index", ""))
                             logger.warning(f"Chunk ID missing from Layer 3 output. Generated fallback ID: {chunk_id}")
-                            c.metadata["chunk_id"] = chunk_id # Add to metadata for consistency
+                            c.metadata["child_chunk_id"] = chunk_id
 
-                        # Ensure 'text' field is present (it should be from Layer 3)
                         if "text" not in c.metadata:
                              c.metadata["text"] = c.page_content
                              logger.warning(f"Metadata 'text' field missing for chunk '{chunk_id}'. Added from page_content.")
 
-                        # Final shrink check: This should ideally not trigger if Layer 3 worked correctly,
-                        # but it's a critical last line of defense against oversized metadata.
-                        final_metadata_for_upsert = _shrink_metadata_to_limit(c.metadata, logger, PINECONE_METADATA_MAX_BYTES)
-                        
-                        # If the text was truncated here, it means something went wrong earlier,
-                        # or the original chunk was already too large.
-                        if final_metadata_for_upsert.get("text_truncated", False):
-                            logger.critical(f"CRITICAL: Chunk '{chunk_id}' text was truncated AGAIN at upsert stage. This indicates a serious issue in prior metadata handling or chunk size.")
-                            status_container.write(f"❌ Critical: Chunk '{chunk_id}' text truncated at final upsert. Review logs.")
+                        # Metadata should already be canonicalized and shrunk in _generate_child_chunks or _process_special_elements
+                        # No need for a second _shrink_metadata_to_limit call here.
+                        final_metadata_for_upsert = c.metadata
+
+                        # The "truncated AGAIN" warning should no longer appear if the metadata was properly handled upstream.
+                        # If it still appears, it indicates a deeper issue in the _shrink_metadata_to_limit function itself
+                        # or an extremely large chunk that cannot fit even minimal metadata.
 
                         file_records.append((chunk_id, vec, final_metadata_for_upsert))
-                    logger.info(f"Prepared {len(file_records)} records for upsert for '{file_name}'.")
+                    logger.info(f"Prepared {len(file_records)} records for upsert for '{original_file_name}'.")
 
-                    status_container.update(label=f"Processing document: **{file_name}** - Upserting to Pinecone...", state="running")
+                    status_container.update(label=f"Processing document: **{original_file_name}** - Upserting to Pinecone...", state="running")
                     total_file_records = len(file_records)
                     for i in range(0, total_file_records, UPSERT_BATCH_SIZE):
                         batch = file_records[i : i + UPSERT_BATCH_SIZE]
                         index.upsert(vectors=batch, namespace=(namespace or None))
-                        status_container.write(f"Upserted batch {i//UPSERT_BATCH_SIZE + 1}/{(total_file_records + UPSERT_BATCH_SIZE - 1) // UPSERT_BATCH_SIZE} ({len(batch)} records) for '{file_name}'.")
-                        logger.debug(f"Upserted batch for '{file_name}': {i//UPSERT_BATCH_SIZE + 1}/{(total_file_records + UPSERT_BATCH_SIZE - 1) // UPSERT_BATCH_SIZE}.")
+                        status_container.write(f"Upserted batch {i//UPSERT_BATCH_SIZE + 1}/{(total_file_records + UPSERT_BATCH_SIZE - 1) // UPSERT_BATCH_SIZE} ({len(batch)} records) for '{original_file_name}'.")
+                        logger.debug(f"Upserted batch for '{original_file_name}': {i//UPSERT_BATCH_SIZE + 1}/{(total_file_records + UPSERT_BATCH_SIZE - 1) // UPSERT_BATCH_SIZE}.")
 
-                    status_container.update(label=f"Document: **{file_name}** processed successfully!", state="complete", expanded=False)
-                    logger.info(f"Successfully processed and upserted all records for '{file_name}'.")
+                    status_container.update(label=f"Document: **{original_file_name}** processed successfully!", state="complete", expanded=False)
+                    logger.info(f"Successfully processed and upserted all records for '{original_file_name}'.")
 
                 except Exception as e:
-                    logger.exception(f"Error processing document '{file_name}'.")
-                    status_container.error(f"Error processing '{file_name}': {e}")
-                    status_container.update(label=f"Document: **{file_name}** failed!", state="error", expanded=True)
+                    logger.exception(f"Error processing document '{original_file_name}'.")
+                    status_container.error(f"Error processing '{original_file_name}': {e}")
+                    status_container.update(label=f"Document: **{original_file_name}** failed!", state="error", expanded=True)
                 finally:
                     if temp_dir and os.path.exists(temp_dir):
                         shutil.rmtree(temp_dir)
-                        logger.debug(f"Cleaned up temp directory for '{file_name}': {temp_dir}")
+                        logger.debug(f"Cleaned up temp directory for '{original_file_name}': {temp_dir}")
 
         st.success("All selected documents have been processed (or skipped as per plan).")
         logger.info("All selected documents processing complete.")
