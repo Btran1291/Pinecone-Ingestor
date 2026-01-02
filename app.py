@@ -431,60 +431,74 @@ def deterministic_chunk_id(
     )
     return chunk_id
 
+def surgical_text_cleaner(text: str) -> str:
+    """
+    Stage 1: Removes non-linguistic commercial artifacts.
+    Stage 2: Collapses structural noise (stars/dashes).
+    Stage 3: Normalizes whitespace to prevent embedding bias.
+    """
+    if not text:
+        return ""
+
+    # 1. Commercial Signatures
+    noise_patterns = [
+        r"\*+.*Febo[qQkK]ok.*\*+", 
+        r"\*+.*DEMO Watermarks.*\*+",
+        r"\*+.*Trial Version.*\*+",
+        r"Produced by an unregistered version.*",
+        r"Converted by Nitro PDF.*",
+        r"Click here to buy.*",
+        r"www\.abisource\.com",
+        r"ABBYY FineReader.*",
+        r"Evaluation Copy.*",
+    ]
+    
+    cleaned = text
+    for pattern in noise_patterns:
+        # Case-insensitive removal of the entire matching line/phrase
+        cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE | re.MULTILINE)
+
+    # 2. Structural Symbol Scrub
+    cleaned = re.sub(r"[\*\-\=\_\#]{4,}", "", cleaned)
+
+    # 3. Whitespace Normalization
+    cleaned = re.sub(r" +", " ", cleaned)          # Collapse multiple spaces
+    cleaned = re.sub(r"(\n\s*){2,}", "\n\n", cleaned) # Collapse excessive newlines
+
+    return cleaned.strip()
+
 
 def _is_structural_noise(text: str) -> bool:
-    """
-    A surgical filter to prevent watermarks and boilerplates from becoming
-    chapter titles or breadcrumbs.
-    """
     if not text:
         return True
 
-    # 1. Preparation: Remove visual decoration (e.g. '*** Header ***' -> 'header')
-    # and lower the case for matching.
-    cleaned_text = text.lower().strip(" \t\n\r*-_=<>[]")
-
-    # 2. Pure Decoration Check
-    # If the line has NO alphanumeric characters after stripping, it's noise.
-    # Safe for technical docs because things like "[A] + [B]" have A and B.
-    if cleaned_text and not any(c.isalnum() for c in cleaned_text):
-        return True
-
-    # 3. High-Confidence Keyword Match
-    # We check the master list of commercial artifacts.
+    cleaned = text.lower().strip(" \t\n\r*-_=<>[]")
+    
+    # 1. Explicit Targeted Filter
     NOISE_TARGETS = {
-        "feboqok",
-        "febokok",
-        "abisource",
-        "unregistered",
-        "trial version",
-        "evaluation copy",
-        "demo watermark",
-        "demo version",
-        "converted by",
-        "produced by",
-        "watermarked",
-        "nitro pdf",
-        "abbyy finereader",
-        "all rights reserved",
-        "click here to buy",
-        "ocr technology",
-        "www.",
-        ".com",
+        "feboqok", "febokok", "abisource", "unregistered", "trial version",
+        "evaluation copy", "demo watermark", "converted by", "produced by",
+        "nitro pdf", "abbyy finereader", "ocr technology", "www.", ".com",
+        "all rights reserved", "click here to buy", "watermarked"
     }
-
-    # Check if ANY target exists in the cleaned text
-    if any(target in cleaned_text for target in NOISE_TARGETS):
+    if any(target in cleaned for target in NOISE_TARGETS):
         return True
 
-    # 4. Short-Line Numeric Noise (e.g. just a page number "88 of 200")
-    # This prevents page numbers from becoming 'Chapter Titles'
-    if len(cleaned_text) < 15 and re.match(
-        r"^(page\s?\d+|[0-9]+\s?of\s?[0-9]+)$", cleaned_text
-    ):
+    # 2. Structural/Visual Noise Gate
+    # Catches things like "-----------" or "**********"
+    if len(cleaned) > 4:
+        alnum_chars = sum(1 for c in cleaned if c.isalnum())
+        if (alnum_chars / len(cleaned)) < 0.3:
+            return True
+
+    # 3. Stray Fragment Gate
+    # Removes single characters or page numbers like "Page 1" that 
+    # shouldn't be titles or chunks.
+    if len(cleaned) < 2 or re.match(r"^(page\s?\d+|[0-9]+\s?of\s?[0-9]+)$", cleaned):
         return True
 
     return False
+
 
 
 def count_tokens(text: str, model_name: str, logger: logging.Logger) -> int:
@@ -569,21 +583,20 @@ def prepend_token_overlap(
 
 def compute_dynamic_threshold(base_amount: float, parent_tokens: int) -> float:
     """
-    Adjusts the semantic chunker threshold so short parents split less aggressively
-    and long parents split more aggressively.
+    General-purpose logic: If a section is already relatively short (under 1500 tokens), 
+    we increase the threshold to prevent unnecessary splitting.
     """
     if parent_tokens <= 0:
         return base_amount
 
-    # Heuristic:
-    # - Very short (<800 tokens): lower threshold (easier to split)
-    # - Medium (800–4000): stay near base
-    # - Very long (>4000): raise threshold (stricter splits)
-    if parent_tokens < 800:
-        return max(75.0, base_amount - 10.0)
-    if parent_tokens > 4000:
-        return min(99.0, base_amount + 4.0)
+    # If the text block is under ~1500 tokens (approx 6-8 paragraphs), 
+    # we make it harder to split. This keeps coherent ideas together.
+    if parent_tokens < 1500:
+        return min(99.5, base_amount + 1.5)
+    
+    # For very large sections, we use the user's base setting.
     return base_amount
+
 
 
 def _canonicalize_and_filter_metadata(
@@ -962,13 +975,7 @@ def _create_parent_documents(
     current_parent_tokens = 0
 
     # Define strong structural breaks. These categories from Unstructured.io often mark new sections.
-    MAJOR_STRUCTURAL_BREAKS = {
-        "Title",
-        "Header",
-        "Subheader",
-        "NarrativeText",
-        "ListItem",
-    }
+    MAJOR_STRUCTURAL_BREAKS = {"Title", "Header"} 
 
     # Heuristic: If a NarrativeText or ListItem is very short and follows a significant break,
     # it might be a de-facto heading or a very short, distinct point.
@@ -1007,21 +1014,13 @@ def _create_parent_documents(
 
         # Check for a new parent document break
         is_major_break = False
+        # Only Title or Header triggers a hard break
         if element_category in MAJOR_STRUCTURAL_BREAKS:
-            # If it's a heading-like category, it's a strong break
-            if element_category in {"Title", "Header", "Subheader"}:
-                is_major_break = True
-            # If it's a NarrativeText or ListItem, but it's very short and distinct,
-            # it might also indicate a new logical section.
-            elif len(element_text) < SHORT_ELEMENT_AS_BREAK_THRESHOLD and (
-                not current_parent_content
-                or (  # Always start a new parent if it's the first element
-                    current_parent_content
-                    and len(" ".join(current_parent_content))
-                    > SHORT_ELEMENT_AS_BREAK_THRESHOLD * 2
-                )
-            ):  # Only break if current parent has significant content
-                is_major_break = True
+            is_major_break = True
+        
+        # Safety: If a parent is getting excessively long, force a break
+        if current_parent_tokens > 2500:
+            is_major_break = True
 
         # Also consider significant page number jumps as a break
         if "page_number" in element.metadata and current_parent_metadata.get(
@@ -1408,7 +1407,7 @@ def _generate_child_chunks(
         )
         return [], {}
 
-    max_child_chunk_tokens = 1000
+    max_child_chunk_tokens = 2000
     semantic_chunk_overlap_tokens = 150
 
     # Reuse one embeddings client plus cached semantic chunkers
@@ -1684,24 +1683,60 @@ def _generate_child_chunks(
             prev_chunk_text = child_text
             chunk_order_counter += 1
 
-        for idx, chunk_doc in enumerate(temp_child_chunks):
-            prev_id = (
-                temp_child_chunks[idx - 1].metadata.get("child_chunk_id")
-                if idx > 0
-                else None
-            )
-            next_id = (
-                temp_child_chunks[idx + 1].metadata.get("child_chunk_id")
-                if idx < len(temp_child_chunks) - 1
-                else None
-            )
+        final_processed_chunks = []
+        COHESION_MIN_CHARS = 500
 
-            if prev_id:
-                chunk_doc.metadata["previous_chunk_id"] = prev_id
-            if next_id:
-                chunk_doc.metadata["next_chunk_id"] = next_id
+        # Stage 1: Greedy Cohesion Pass
+        # Consolidates short 'orphan' chunks into their neighbors
+        buffer_doc = None
 
-        all_child_chunks.extend(temp_child_chunks)
+        for doc in temp_child_chunks:
+            if buffer_doc is None:
+                buffer_doc = doc
+                continue
+            
+            # If the current buffer is too small, we merge the NEXT chunk into it
+            if len(buffer_doc.page_content) < COHESION_MIN_CHARS:
+                # 1. Merge Text Content
+                new_content = buffer_doc.page_content + "\n" + doc.page_content
+                buffer_doc.page_content = new_content
+                buffer_doc.metadata["text"] = new_content
+                
+                # 2. Update Character Ranges (Essential for PDF Mapping)
+                b_range = buffer_doc.metadata.get("char_range")
+                d_range = doc.metadata.get("char_range")
+                if b_range and d_range:
+                    # New range is [Start of A, End of B]
+                    buffer_doc.metadata["char_range"] = [b_range[0], d_range[1]]
+                    buffer_doc.metadata["char_range_unique"] = [b_range[0], d_range[1]]
+                
+                # 3. Regenerate deterministic ID for the new combined content
+                buffer_doc.metadata["child_chunk_id"] = deterministic_chunk_id(
+                    buffer_doc.metadata.get("parent_chunk_id", "orphan"),
+                    new_content,
+                    str(buffer_doc.metadata.get("page_number", "")),
+                    str(buffer_doc.metadata.get("char_range", [0])[0])
+                )
+                logger.debug(f"Master Cohesion: Merged orphan into cohesive unit ({len(new_content)} chars)")
+            else:
+                # Buffer is large enough, move it to final list and start new buffer
+                final_processed_chunks.append(buffer_doc)
+                buffer_doc = doc
+
+        # Add the final trailing chunk
+        if buffer_doc:
+            final_processed_chunks.append(buffer_doc)
+
+        # Stage 2: Linked-List Integrity Pass
+        for idx, chunk_doc in enumerate(final_processed_chunks):
+            p_id = final_processed_chunks[idx - 1].metadata.get("child_chunk_id") if idx > 0 else None
+            n_id = final_processed_chunks[idx + 1].metadata.get("child_chunk_id") if idx < len(final_processed_chunks) - 1 else None
+            
+            if p_id: chunk_doc.metadata["previous_chunk_id"] = p_id
+            if n_id: chunk_doc.metadata["next_chunk_id"] = n_id
+        
+        all_child_chunks.extend(final_processed_chunks)
+
 
     logger.info(
         f"Generated {len(all_child_chunks)} child chunks from {len(filtered_parent_documents)} parent documents."
@@ -3610,7 +3645,25 @@ def main():
                     loader = UnstructuredLoader(
                         file_path, strategy=unstructured_strategy
                     )
-                    raw_elements = list(loader.lazy_load())
+                    # --- UPDATED LOADING LOGIC ---
+                    loader = UnstructuredLoader(
+                        file_path, strategy=unstructured_strategy
+                    )
+                    
+                    initial_elements = list(loader.lazy_load())
+                    
+                    raw_elements = []
+                    for element in initial_elements:
+                        original_text = element.page_content or ""
+                        clean_text = surgical_text_cleaner(original_text)
+                        
+                        if clean_text.strip():
+                            element.page_content = clean_text
+                            raw_elements.append(element)
+
+                    status_container.write(
+                        f"Loaded {len(initial_elements)} parts. Sanitized down to {len(raw_elements)} clean elements."
+                    )
                     status_container.write(
                         f"Loaded {len(raw_elements)} raw parts using '{unstructured_strategy}' strategy."
                     )
