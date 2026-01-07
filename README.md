@@ -1,12 +1,3 @@
----
-license: mit
-title: Pinecone Ingestor
-sdk: docker
-emoji: 🚀
-colorFrom: indigo
-colorTo: blue
-short_description: A Streamlit app that ingests documents to Pinecone database.
----
 # Pinecone Ingestor
 
 [![Python](https://img.shields.io/badge/python-3.11+-blue)](https://www.python.org/downloads/)
