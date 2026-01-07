@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import os
 import tempfile
 import shutil
@@ -8,6 +9,7 @@ import re
 import uuid
 import time
 import logging
+import threading
 from collections import deque, defaultdict
 from dotenv import load_dotenv
 from langchain_unstructured import UnstructuredLoader
@@ -28,65 +30,98 @@ import tiktoken
 import spacy
 import nltk
 
+# -------- Logging Configuration (Must be defined before use) --------
+class StreamlitLogHandler(logging.Handler):
+    def __init__(self, max_records=500):
+        super().__init__()
+        self.log_records = deque(maxlen=max_records)
+        self.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+
+    def emit(self, record):
+        self.log_records.append(self.format(record))
+
+    def get_records(self):
+        return list(self.log_records)
+
+def setup_logging_once(level=logging.INFO):
+    if "session_id" not in st.session_state:
+        st.session_state.session_id = str(uuid.uuid4())
+    
+    if "streamlit_handler" not in st.session_state:
+        st.session_state.streamlit_handler = StreamlitLogHandler()
+
+    logger_name = f"AppLogger_{st.session_state.session_id}"
+    logger = logging.getLogger(logger_name)
+    
+    logger.setLevel(level)
+
+    if not logger.handlers:
+        logger.addHandler(st.session_state.streamlit_handler)
+        if "SPACE_ID" not in os.environ: # Only console log if NOT on Hugging Face
+            logger.addHandler(logging.StreamHandler())
+        
+        st.session_state.app_logger = logger
+        logger.info(f"Logger initialized for Session: {st.session_state.session_id}")
+    
+    return logger
+
+def _get_safe_logger(name_suffix: str = "Generic"):
+    try:
+        return st.session_state.get("app_logger") or logging.getLogger(
+            f"AppLogger_{st.session_state.get('session_id', name_suffix)}"
+        )
+    except Exception:
+        return logging.getLogger(f"AppLogger_Fallback_{name_suffix}")
+
+# -------- Start Global Initialization --------
+# 1. Define HF Context
+IS_ON_HF = "SPACE_ID" in os.environ
+
+# 2. Setup Logging and capture NLTK events immediately
+logger = setup_logging_once()
 try:
     nltk.data.find("tokenizers/punkt")
 except LookupError:
     nltk.download("punkt", quiet=True)
+    logger.info("NLTK data downloaded successfully.")
 except Exception as e:
-    print(f"An unexpected error occurred during NLTK data download: {e}")
+    logger.error(f"NLTK setup error: {e}")
 
-# -------- Logging Configuration --------
-class StreamlitLogHandler(logging.Handler):
+# 3. Define isolated workspace paths
+BASE_DIR = os.getcwd()
+if IS_ON_HF:
+    # On HF, isolation is critical to prevent cross-user data leakage
+    DATA_DIR = os.path.join(BASE_DIR, "sessions", st.session_state.session_id)
+else:
+    # Locally, stay in the root for easy access to manifest and .env
+    DATA_DIR = BASE_DIR
+
+os.makedirs(DATA_DIR, exist_ok=True)
+
+# 4. Path Helpers
+def get_manifest_path():
+    return os.path.join(DATA_DIR, "pinecone_manifest.json")
+
+def get_cache_path(doc_id: str):
+    cache_folder = os.path.join(DATA_DIR, ".ingest_cache")
+    os.makedirs(cache_folder, exist_ok=True)
+    return os.path.join(cache_folder, f"cache_{doc_id}.json")
+
+_GLOBAL_CHECKPOINT_LOCKS: dict[str, threading.Lock] = {}
+
+def _get_checkpoint_lock(doc_id: str) -> threading.Lock:
     """
-    A custom logging handler that captures log records and stores them in a deque
-    for display within a Streamlit application.
+    Returns a per-document threading.Lock. Uses st.session_state when available;
+    falls back to a module-level dict otherwise.
     """
+    try:
+        lock_map = st.session_state.setdefault("_checkpoint_locks", {})
+    except Exception:
+        lock_map = _GLOBAL_CHECKPOINT_LOCKS
 
-    def __init__(self, max_records=100):
-        super().__init__()
-        self.log_records = deque(maxlen=max_records)
-        self.setFormatter(
-            logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-        )
-
-    def emit(self, record):
-        """Appends formatted log record to the deque."""
-        self.log_records.append(self.format(record))
-
-    def get_records(self):
-        """Retrieves all stored log records."""
-        return list(self.log_records)
-
-
-def setup_logging_once(level=logging.INFO):
-    """
-    Initializes the application logger and attaches the StreamlitLogHandler.
-    Ensures that the logger is set up only once per session.
-    """
-    if "streamlit_handler" not in st.session_state:
-        st.session_state.streamlit_handler = StreamlitLogHandler()
-
-    if "app_logger" not in st.session_state:
-        st.session_state.app_logger = logging.getLogger(__name__)
-        st.session_state.app_logger.setLevel(level)
-
-        if not any(
-            isinstance(h, StreamlitLogHandler)
-            for h in st.session_state.app_logger.handlers
-        ):
-            st.session_state.app_logger.addHandler(st.session_state.streamlit_handler)
-        if not any(
-            isinstance(h, logging.StreamHandler)
-            for h in st.session_state.app_logger.handlers
-        ):
-            st.session_state.app_logger.addHandler(logging.StreamHandler())
-
-        st.session_state.app_logger.info(
-            f"Logger initialized with level {logging.getLevelName(level)}."
-        )
-
-    return st.session_state.app_logger
-
+    if doc_id not in lock_map:
+        lock_map[doc_id] = threading.Lock()
+    return lock_map[doc_id]
 
 # -------- Application Defaults --------
 DEFAULT_SETTINGS = {
@@ -107,8 +142,8 @@ DEFAULT_SETTINGS = {
     "WHITELISTED_KEYWORDS": "",
     "MIN_GENERIC_CONTENT_LENGTH": "150",
     "ENABLE_NER_FILTERING": "True",
-    "UNSTRUCTURED_STRATEGY": "hi_res",
-    "MIN_CHUNK_LENGTH": "150",
+    "UNSTRUCTURED_STRATEGY": "fast",
+    "MIN_CHILD_CHUNK_LENGTH": "100",
     "KEEP_LOW_CONFIDENCE_SNIPPETS": "False",
 }
 
@@ -206,37 +241,80 @@ def load_spacy_model(model_name="en_core_web_sm"):
 
 
 # -------- Helper Functions --------
+def sync_browser_storage(data=None, action="load"):
+    """
+    Professional bridge between Streamlit and Browser localStorage.
+    Only executes when hosted on Hugging Face to ensure persistence.
+    """
+    if not IS_ON_HF:
+        return
+    
+    # Unique key for this app's storage to prevent collisions
+    STORAGE_KEY = "pinecone_ingestor_v1_config"
+    
+    if action == "save" and data:
+        # Push: Save JSON to browser
+        json_data = json.dumps(data).replace("'", "\\'")
+        js_code = f"""
+            <script>
+                localStorage.setItem('{STORAGE_KEY}', '{json_data}');
+                console.log('Configuration saved to browser storage.');
+            </script>
+        """
+        components.html(js_code, height=0)
+        
+    elif action == "load":
+        # Pull: Read from browser and send to Streamlit via query params
+        # This is a 'handshake' - JS reads storage and puts it in the URL
+        # so Python can read it once, then we clear the URL.
+        js_code = f"""
+            <script>
+                const data = localStorage.getItem('{STORAGE_KEY}');
+                if (data) {{
+                    const url = new URL(window.location);
+                    if (!url.searchParams.has('hydrated')) {{
+                        url.searchParams.set('hydrated', 'true');
+                        url.searchParams.set('config_payload', data);
+                        window.location.href = url.href;
+                    }}
+                }}
+            </script>
+        """
+        components.html(js_code, height=0)
+
+    elif action == "clear":
+        # Purge: Remove data from browser
+        js_code = f"""
+            <script>
+                localStorage.removeItem('{STORAGE_KEY}');
+                console.log('Browser storage cleared.');
+                window.location.reload();
+            </script>
+        """
+        components.html(js_code, height=0)
+
 def save_uploaded_file_to_temp(uploaded_file):
-    """
-    Saves an uploaded Streamlit file to a temporary directory on the server.
-    Returns the file path, the temporary directory path, and the file bytes.
-    """
+    """Saves file to the session-specific sandbox."""
     logger = st.session_state.app_logger
-    logger.debug(f"Attempting to save uploaded file: {uploaded_file.name}")
+    logger.debug(f"Saving uploaded file: {uploaded_file.name}")
     temp_dir = None
     try:
-        temp_dir = tempfile.mkdtemp()
+        # Force the temp directory into the private session sandbox
+        session_temp_root = os.path.join(DATA_DIR, "temp")
+        os.makedirs(session_temp_root, exist_ok=True)
+
+        temp_dir = tempfile.mkdtemp(dir=session_temp_root)
         file_path = os.path.join(temp_dir, uploaded_file.name)
         file_bytes = uploaded_file.getvalue()
         with open(file_path, "wb") as f:
             f.write(file_bytes)
-        logger.info(
-            f"Successfully saved {uploaded_file.name} to temporary path: {file_path}"
-        )
+        logger.info(f"Saved {uploaded_file.name} to sandbox: {file_path}")
         return file_path, temp_dir, file_bytes
-    except (IOError, OSError) as e:
-        if temp_dir:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        logger.exception(f"Error saving uploaded file {uploaded_file.name}")
-        st.error(f"Error saving uploaded file: {e}")
-        return None, None, None
     except Exception as e:
         if temp_dir:
             shutil.rmtree(temp_dir, ignore_errors=True)
-        logger.exception(
-            f"An unexpected error occurred while saving uploaded file {uploaded_file.name}"
-        )
-        st.error(f"An unexpected error occurred: {e}")
+        logger.exception(f"Error saving {uploaded_file.name}")
+        st.error(f"Error saving uploaded file: {e}")
         return None, None, None
 
 
@@ -259,40 +337,123 @@ def is_running_locally():
     return is_local
 
 
-MANIFEST_PATH = "pinecone_manifest.json"
-
-
 def _load_manifest() -> list[dict]:
-    if not os.path.exists(MANIFEST_PATH):
+    logger = _get_safe_logger("ManifestLoad")
+    path = get_manifest_path()
+    if not os.path.exists(path):
         return []
     try:
-        with open(MANIFEST_PATH, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Manifest read failed: {e}")
         return []
+
 
 
 def _save_manifest(entries: list[dict]):
-    with open(MANIFEST_PATH, "w", encoding="utf-8") as f:
-        json.dump(entries, f, indent=2)
+    logger = _get_safe_logger("ManifestSave")
+    try:
+        with open(get_manifest_path(), "w", encoding="utf-8") as f:
+            json.dump(entries, f, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to write manifest: {e}")
 
+
+
+def load_doc_checkpoint(doc_id: str):
+    try:
+        logger = st.session_state.get("app_logger") or logging.getLogger(
+            f"AppLogger_{st.session_state.get('session_id')}"
+        )
+    except Exception:
+        logger = logging.getLogger("AppLogger_Fallback")
+    path = get_cache_path(doc_id)
+    lock = _get_checkpoint_lock(doc_id)
+    with lock:
+        if os.path.exists(path):
+            try:
+                with open(path, "r") as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.warning(
+                    f"Corrupt checkpoint found for {doc_id}: {e}. Starting fresh."
+                )
+                return {}
+    return {}
+
+def save_doc_checkpoint(doc_id: str, data: dict):
+    path = get_cache_path(doc_id)
+    lock = _get_checkpoint_lock(doc_id)
+    with lock:
+        with tempfile.NamedTemporaryFile(
+            "w", delete=False, dir=os.path.dirname(path)
+        ) as tf:
+            json.dump(data, tf)
+            tempname = tf.name
+        os.replace(tempname, path)
+
+def clear_doc_checkpoint(doc_id: str):
+    path = get_cache_path(doc_id)
+    lock = _get_checkpoint_lock(doc_id)
+    with lock:
+        if os.path.exists(path):
+            os.remove(path)
 
 def _append_manifest_entry(document_id: str, file_name: str):
+    logger = _get_safe_logger("ManifestAppend")
     entries = _load_manifest()
-    # Remove existing entry for same document_id
     entries = [e for e in entries if e.get("document_id") != document_id]
     entries.append({"document_id": document_id, "file_name": file_name})
     _save_manifest(entries)
-
+    logger.debug(f"Manifest updated with document_id={document_id}, file_name={file_name}")
 
 def _remove_manifest_entry(document_id: str):
+    logger = _get_safe_logger("ManifestRemove")
     entries = _load_manifest()
-    entries = [e for e in entries if e.get("document_id") != document_id]
-    _save_manifest(entries)
-
+    new_entries = [e for e in entries if e.get("document_id") != document_id]
+    if len(new_entries) != len(entries):
+        _save_manifest(new_entries)
+        logger.debug(f"Removed manifest entry for document_id={document_id}")
+    else:
+        logger.debug(f"No manifest entry found for document_id={document_id}")
 
 def _clear_manifest():
-    _save_manifest([])
+    logger = _get_safe_logger("ManifestClear")
+    try:
+        _save_manifest([])
+        logger.info("Manifest cleared.")
+    except Exception as e:
+        logger.error(f"Failed to clear manifest: {e}")
+
+def pinecone_has_index_cached(
+    pc: Pinecone | None,
+    index_name: str,
+    logger: logging.Logger,
+    cache_scope: str | None = None,
+) -> bool:
+    """
+    Wraps pc.has_index with per-session caching and error handling to avoid repeated
+    control-plane calls and transient exceptions.
+    """
+    if not pc or not index_name:
+        return False
+
+    scope = cache_scope or "default"
+    cache_key = f"has_index::{scope}::{index_name}"
+    cache = st.session_state.setdefault("pinecone_has_index_cache", {})
+
+    if cache_key in cache:
+        return cache[cache_key]
+
+    try:
+        exists = pc.has_index(index_name)
+    except Exception as e:
+        logger.warning(f"Unable to determine if index '{index_name}' exists: {e}")
+        exists = False
+
+    cache[cache_key] = exists
+    return exists
 
 
 def _bootstrap_manifest_from_pinecone(
@@ -369,6 +530,75 @@ def _bootstrap_manifest_from_pinecone(
             "Ensure the index is serverless and contains vectors with document metadata."
         )
 
+def _list_documents_via_pinecone(
+    index,
+    namespace: str | None,
+    logger: logging.Logger,
+    page_size: int = 99,
+    fetch_batch_size: int = 200,
+) -> list[dict]:
+    """
+    Fetches a list of unique documents (document_id + file_name) directly from Pinecone
+    by paginating vector IDs and inspecting their metadata. This avoids using the local
+    manifest, which is useful on Hugging Face where shared filesystem state is not guaranteed.
+
+    Returns:
+        A list of dictionaries: [{"document_id": ..., "file_name": ...}, ...]
+    """
+    namespace_name = namespace or None
+    entries_by_doc: dict[str, str] = {}
+    pagination_token: str | None = None
+    total_ids_seen = 0
+
+    while True:
+        try:
+            list_response = index.list_paginated(
+                namespace=namespace_name,
+                limit=min(max(page_size, 1), 99),
+                pagination_token=pagination_token,
+            )
+        except Exception as e:
+            logger.error(f"Vector ID listing failed: {e}. Aborting listing operation.")
+            break
+
+        vectors = list_response.get("vectors") or []
+        if not vectors:
+            logger.info("No more vector IDs returned during listing.")
+            break
+
+        vector_ids = [vec.get("id") for vec in vectors if vec.get("id")]
+        total_ids_seen += len(vector_ids)
+        logger.debug(f"Fetched {len(vector_ids)} IDs (total so far: {total_ids_seen:,}).")
+
+        for start in range(0, len(vector_ids), fetch_batch_size):
+            chunk_ids = vector_ids[start : start + fetch_batch_size]
+            try:
+                fetch_response = index.fetch(ids=chunk_ids, namespace=namespace_name)
+            except Exception as e:
+                logger.warning(f"Fetch failed for {len(chunk_ids)} IDs: {e}")
+                continue
+
+            fetched_vectors = fetch_response.vectors or {}
+            for vec in fetched_vectors.values():
+                metadata = vec.metadata or {}
+                doc_id = metadata.get("document_id")
+                file_name = metadata.get("file_name")
+                if doc_id and file_name and doc_id not in entries_by_doc:
+                    entries_by_doc[doc_id] = file_name
+
+        pagination_token = (list_response.get("pagination") or {}).get("next")
+        if not pagination_token:
+            logger.info("Reached end of listing pagination.")
+            break
+
+    entries = [
+        {"document_id": doc_id, "file_name": file_name}
+        for doc_id, file_name in entries_by_doc.items()
+    ]
+    logger.info(
+        f"Listing completed via Pinecone API; discovered {len(entries):,} unique documents."
+    )
+    return entries
 
 def _repair_dangling_brackets(text: str) -> str:
     """
@@ -431,6 +661,7 @@ def deterministic_chunk_id(
     )
     return chunk_id
 
+
 def surgical_text_cleaner(text: str) -> str:
     """
     Stage 1: Removes non-linguistic commercial artifacts.
@@ -442,7 +673,7 @@ def surgical_text_cleaner(text: str) -> str:
 
     # 1. Commercial Signatures
     noise_patterns = [
-        r"\*+.*Febo[qQkK]ok.*\*+", 
+        r"\*+.*Febo[qQkK]ok.*\*+",
         r"\*+.*DEMO Watermarks.*\*+",
         r"\*+.*Trial Version.*\*+",
         r"Produced by an unregistered version.*",
@@ -452,34 +683,48 @@ def surgical_text_cleaner(text: str) -> str:
         r"ABBYY FineReader.*",
         r"Evaluation Copy.*",
     ]
-    
+
+    logger = st.session_state.get("app_logger", logging.getLogger(f"AppLogger_{st.session_state.get('session_id')}"))
+    initial_len = len(text)
     cleaned = text
     for pattern in noise_patterns:
-        # Case-insensitive removal of the entire matching line/phrase
         cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE | re.MULTILINE)
 
-    # 2. Structural Symbol Scrub
     cleaned = re.sub(r"[\*\-\=\_\#]{4,}", "", cleaned)
-
-    # 3. Whitespace Normalization
-    cleaned = re.sub(r" +", " ", cleaned)          # Collapse multiple spaces
-    cleaned = re.sub(r"(\n\s*){2,}", "\n\n", cleaned) # Collapse excessive newlines
-
-    return cleaned.strip()
-
+    cleaned = re.sub(r" +", " ", cleaned)
+    cleaned = re.sub(r"(\n\s*){2,}", "\n\n", cleaned)
+    
+    final_text = cleaned.strip()
+    if initial_len - len(final_text) > 0:
+        logger.debug(f"Surgical Cleaner: Removed {initial_len - len(final_text)} noise characters.")
+    
+    return final_text
 
 def _is_structural_noise(text: str) -> bool:
     if not text:
         return True
 
     cleaned = text.lower().strip(" \t\n\r*-_=<>[]")
-    
+
     # 1. Explicit Targeted Filter
     NOISE_TARGETS = {
-        "feboqok", "febokok", "abisource", "unregistered", "trial version",
-        "evaluation copy", "demo watermark", "converted by", "produced by",
-        "nitro pdf", "abbyy finereader", "ocr technology", "www.", ".com",
-        "all rights reserved", "click here to buy", "watermarked"
+        "feboqok",
+        "febokok",
+        "abisource",
+        "unregistered",
+        "trial version",
+        "evaluation copy",
+        "demo watermark",
+        "converted by",
+        "produced by",
+        "nitro pdf",
+        "abbyy finereader",
+        "ocr technology",
+        "www.",
+        ".com",
+        "all rights reserved",
+        "click here to buy",
+        "watermarked",
     }
     if any(target in cleaned for target in NOISE_TARGETS):
         return True
@@ -492,13 +737,12 @@ def _is_structural_noise(text: str) -> bool:
             return True
 
     # 3. Stray Fragment Gate
-    # Removes single characters or page numbers like "Page 1" that 
+    # Removes single characters or page numbers like "Page 1" that
     # shouldn't be titles or chunks.
     if len(cleaned) < 2 or re.match(r"^(page\s?\d+|[0-9]+\s?of\s?[0-9]+)$", cleaned):
         return True
 
     return False
-
 
 
 def count_tokens(text: str, model_name: str, logger: logging.Logger) -> int:
@@ -583,20 +827,19 @@ def prepend_token_overlap(
 
 def compute_dynamic_threshold(base_amount: float, parent_tokens: int) -> float:
     """
-    General-purpose logic: If a section is already relatively short (under 1500 tokens), 
+    General-purpose logic: If a section is already relatively short (under 1500 tokens),
     we increase the threshold to prevent unnecessary splitting.
     """
     if parent_tokens <= 0:
         return base_amount
 
-    # If the text block is under ~1500 tokens (approx 6-8 paragraphs), 
+    # If the text block is under ~1500 tokens (approx 6-8 paragraphs),
     # we make it harder to split. This keeps coherent ideas together.
     if parent_tokens < 1500:
         return min(99.5, base_amount + 1.5)
-    
+
     # For very large sections, we use the user's base setting.
     return base_amount
-
 
 
 def _canonicalize_and_filter_metadata(
@@ -774,18 +1017,19 @@ def _shrink_metadata_to_limit(
     )
     prioritized.extend(other_keys_sorted)
 
-    # Try removing lowest priority items first (reverse of prioritized)
-    pruned = dict(metadata)  # copy
+    critical_keys = {"document_id", "file_name", "child_chunk_id", "chunk_id", "parent_chunk_id"}
+    pruned = dict(metadata)
     for key in reversed(prioritized):
         if len(json.dumps(pruned).encode("utf-8")) <= pinecone_metadata_max_bytes:
             break
-        if key == "text":
-            # don't remove text yet
+        if key == "text" or key in critical_keys:
+            # don't remove text yet, and never remove critical identifiers
             continue
         if key in pruned:
             logger.debug(f"Removing metadata key '{key}' to reduce size.")
             removed_keys.append(key)
             pruned.pop(key, None)
+
 
     # If still too big, attempt to remove other keys not in RAG_ALLOWED_KEYS
     if len(json.dumps(pruned).encode("utf-8")) > pinecone_metadata_max_bytes:
@@ -855,12 +1099,13 @@ def _shrink_metadata_to_limit(
 
     if removed_keys:
         unique_keys = sorted(set(removed_keys))
-        preview = unique_keys[:5]
-        suffix = "..." if len(unique_keys) > 5 else ""
-        logger.warning(f"Metadata shrink removed keys: {preview}{suffix}")
+        logger.info(f"Metadata size limit reached ({size} bytes). Pruned {len(unique_keys)} keys to reach {final_size} bytes.")
+        logger.debug(f"Pruned metadata keys: {unique_keys}")
+    
+    if pruned.get("text_truncated"):
+        logger.warning("CRITICAL: Metadata 'text' field was truncated to fit Pinecone limits.")
 
     return pruned
-
 
 def _finalize_parent_section(
     parent_documents: list[Document],
@@ -975,7 +1220,7 @@ def _create_parent_documents(
     current_parent_tokens = 0
 
     # Define strong structural breaks. These categories from Unstructured.io often mark new sections.
-    MAJOR_STRUCTURAL_BREAKS = {"Title", "Header"} 
+    MAJOR_STRUCTURAL_BREAKS = {"Title", "Header"}
 
     # Heuristic: If a NarrativeText or ListItem is very short and follows a significant break,
     # it might be a de-facto heading or a very short, distinct point.
@@ -1017,7 +1262,7 @@ def _create_parent_documents(
         # Only Title or Header triggers a hard break
         if element_category in MAJOR_STRUCTURAL_BREAKS:
             is_major_break = True
-        
+
         # Safety: If a parent is getting excessively long, force a break
         if current_parent_tokens > 2500:
             is_major_break = True
@@ -1035,6 +1280,10 @@ def _create_parent_documents(
                 pass  # Ignore if page numbers are not easily convertible to int
 
         if is_major_break and current_parent_content:
+            # We extract the file name from the first element's metadata
+            fname = raw_elements[0].metadata.get('file_name', 'unknown_file')
+            logger.debug(f"Triggering section break for '{fname}' due to: "
+                         f"{'Major Category ('+element_category+')' if element_category in MAJOR_STRUCTURAL_BREAKS else 'Token/Page Limit'}")
             _finalize_parent_section(
                 parent_documents=parent_documents,
                 parent_doc_store=parent_doc_store,
@@ -1694,14 +1943,14 @@ def _generate_child_chunks(
             if buffer_doc is None:
                 buffer_doc = doc
                 continue
-            
+
             # If the current buffer is too small, we merge the NEXT chunk into it
             if len(buffer_doc.page_content) < COHESION_MIN_CHARS:
                 # 1. Merge Text Content
                 new_content = buffer_doc.page_content + "\n" + doc.page_content
                 buffer_doc.page_content = new_content
                 buffer_doc.metadata["text"] = new_content
-                
+
                 # 2. Update Character Ranges (Essential for PDF Mapping)
                 b_range = buffer_doc.metadata.get("char_range")
                 d_range = doc.metadata.get("char_range")
@@ -1709,15 +1958,20 @@ def _generate_child_chunks(
                     # New range is [Start of A, End of B]
                     buffer_doc.metadata["char_range"] = [b_range[0], d_range[1]]
                     buffer_doc.metadata["char_range_unique"] = [b_range[0], d_range[1]]
-                
+
                 # 3. Regenerate deterministic ID for the new combined content
                 buffer_doc.metadata["child_chunk_id"] = deterministic_chunk_id(
                     buffer_doc.metadata.get("parent_chunk_id", "orphan"),
                     new_content,
                     str(buffer_doc.metadata.get("page_number", "")),
-                    str(buffer_doc.metadata.get("char_range", [0])[0])
+                    str(buffer_doc.metadata.get("char_range", [0])[0]),
                 )
-                logger.debug(f"Master Cohesion: Merged orphan into cohesive unit ({len(new_content)} chars)")
+                logger.debug(
+                    f"Master Cohesion: Merged orphan into cohesive unit. "
+                    f"New range: {buffer_doc.metadata.get('char_range')} | "
+                    f"New length: {len(new_content)} chars."
+                )
+
             else:
                 # Buffer is large enough, move it to final list and start new buffer
                 final_processed_chunks.append(buffer_doc)
@@ -1726,17 +1980,40 @@ def _generate_child_chunks(
         # Add the final trailing chunk
         if buffer_doc:
             final_processed_chunks.append(buffer_doc)
+            
+        parent_to_child_map[parent_chunk_id] = []
+        for idx, chunk_doc in enumerate(final_processed_chunks):
+            meta = chunk_doc.metadata
+            parent_to_child_map[parent_chunk_id].append(
+                {
+                    "chunk_id": meta.get("child_chunk_id"),
+                    "page_number": meta.get("page_number"),
+                    "chunk_index": idx,
+                    "start_index": meta.get("char_range", [None])[0],
+                    "start_index_hint": meta.get("start_index"),
+                    "char_range": meta.get("char_range"),
+                }
+            )
 
         # Stage 2: Linked-List Integrity Pass
         for idx, chunk_doc in enumerate(final_processed_chunks):
-            p_id = final_processed_chunks[idx - 1].metadata.get("child_chunk_id") if idx > 0 else None
-            n_id = final_processed_chunks[idx + 1].metadata.get("child_chunk_id") if idx < len(final_processed_chunks) - 1 else None
-            
-            if p_id: chunk_doc.metadata["previous_chunk_id"] = p_id
-            if n_id: chunk_doc.metadata["next_chunk_id"] = n_id
-        
-        all_child_chunks.extend(final_processed_chunks)
+            p_id = (
+                final_processed_chunks[idx - 1].metadata.get("child_chunk_id")
+                if idx > 0
+                else None
+            )
+            n_id = (
+                final_processed_chunks[idx + 1].metadata.get("child_chunk_id")
+                if idx < len(final_processed_chunks) - 1
+                else None
+            )
 
+            if p_id:
+                chunk_doc.metadata["previous_chunk_id"] = p_id
+            if n_id:
+                chunk_doc.metadata["next_chunk_id"] = n_id
+
+        all_child_chunks.extend(final_processed_chunks)
 
     logger.info(
         f"Generated {len(all_child_chunks)} child chunks from {len(filtered_parent_documents)} parent documents."
@@ -2190,9 +2467,13 @@ def manage_documents_ui(
 
     st.markdown("---")
     st.header("3. Manage Existing Documents")
-    st.write(
-        "Load, search, and manage individual documents in the selected Pinecone namespace."
+    st.info(
+        "Load, search, and manage documents currently stored in the selected Pinecone namespace. "
+        "You can inspect metadata or delete specific documents directly from this panel."
     )
+    st.caption(f"Current namespace: {namespace or 'Default'}")
+
+
 
     if not pinecone_api_key or not pinecone_index_name:
         st.info(
@@ -2215,11 +2496,12 @@ def manage_documents_ui(
 
     index = None
     try:
-        if pc.has_index(pinecone_index_name):
+        if pinecone_has_index_cached(pc, pinecone_index_name, logger, pinecone_api_key):
             index = pc.Index(pinecone_index_name)
             logger.info(f"Connected to Pinecone index '{pinecone_index_name}'.")
         else:
             logger.warning(f"Pinecone index '{pinecone_index_name}' does not exist.")
+
     except Exception as e:
         logger.exception(f"Could not resolve index info for '{pinecone_index_name}'.")
         st.warning(f"Could not resolve index info: {e}")
@@ -2279,72 +2561,129 @@ def manage_documents_ui(
 
     st.markdown("---")
     st.subheader("Your Documents in Current Namespace")
+    col_limit, col_button = st.columns([0.5, 0.5])
+    with col_limit:
+        load_limit = st.number_input(
+            "Max document names to load",
+            min_value=1,
+            max_value=10000,
+            value=1000,
+            step=100,
+            help="Higher values may increase load time. Pinecone's query limit is 10,000 documents.",
+        )
+    with col_button:
+        load_docs_clicked = st.button(
+            "📥 Load Document Names",
+            use_container_width=True,
+            key="load_all_docs_button",
+        )
+        if IS_ON_HF:
+            st.caption(
+                "Fetched live from your Pinecone namespace. Ensure you’re using your own API key/index."
+            )
+    st.markdown("</div></div>", unsafe_allow_html=True)
 
-    load_limit = st.number_input(
-        "Max Document Names to Load (for display/management)",
-        min_value=1,
-        max_value=10000,
-        value=1000,
-        step=100,
-        help="Specify the maximum number of document names to attempt to load from Pinecone. Higher values may be slower and might not retrieve all names if the index is very large (Pinecone's query limit is 10,000).",
-    )
+    if load_docs_clicked:
+        logger.info(f"Loading document names. Sandbox Mode (IS_ON_HF): {IS_ON_HF}")
 
-    if st.button("Load Document Names", key="load_all_docs_button"):
-        logger.info("Loading document names from manifest.")
-        entries = _load_manifest()
+        entries: list[dict] = []
 
-        if not entries:
+        if IS_ON_HF:
             if not index:
-                st.warning("Manifest missing and index unavailable; cannot bootstrap.")
+                st.warning("Pinecone index not available; cannot list documents.")
                 st.session_state.all_document_names = []
             else:
-                with st.spinner(
-                    "Manifest missing. Scanning Pinecone to rebuild (may take time)..."
-                ):
-                    _bootstrap_manifest_from_pinecone(
+                with st.spinner("Fetching document list from Pinecone..."):
+                    entries = _list_documents_via_pinecone(
                         index=index,
                         namespace=namespace or None,
                         logger=logger,
-                        embedding_dimension=embedding_dimension,
                     )
-                entries = _load_manifest()
                 if not entries:
+                    st.info(
+                        "No documents found in this namespace. Upload some files to get started."
+                    )
+                    st.session_state.all_document_names = []
+        else:
+            entries = _load_manifest()
+            if not entries:
+                if not index:
                     st.warning(
-                        "Failed to rebuild manifest. Upload documents first or check permissions."
+                        "Local manifest missing and Pinecone index is offline; cannot rebuild."
                     )
                     st.session_state.all_document_names = []
                 else:
-                    st.success(f"Manifest rebuilt with {len(entries)} entries.")
+                    with st.spinner(
+                        "Local manifest missing. Scanning Pinecone to rebuild (this may take time)..."
+                    ):
+                        _bootstrap_manifest_from_pinecone(
+                            index=index,
+                            namespace=namespace or None,
+                            logger=logger,
+                            embedding_dimension=embedding_dimension,
+                        )
+                    entries = _load_manifest()
+                    if not entries:
+                        st.warning(
+                            "Bootstrap complete, but no documents were found in Pinecone."
+                        )
+                        st.session_state.all_document_names = []
+                    else:
+                        st.success(
+                            f"Local manifest rebuilt with {len(entries)} documents found in Pinecone."
+                        )
 
         if entries:
-            st.session_state.all_document_names = sorted(
+            all_names = sorted(
                 {entry["file_name"] for entry in entries if entry.get("file_name")}
             )
-            st.success(
-                f"Loaded {len(st.session_state.all_document_names)} document names."
+            st.session_state.all_document_names = all_names[: load_limit]
+
+            st.markdown(
+                f"""
+                <div style="background:#ecfdf5;border:1px solid #bbf7d0;border-radius:12px;padding:0.8rem 1rem;margin-bottom:0.7rem;color:#065f46;">
+                    ✅ Successfully loaded {len(st.session_state.all_document_names)} document names (capped at {load_limit}).
+                </div>
+                """,
+                unsafe_allow_html=True,
             )
+            st.session_state.document_entries = entries
+            logger.debug(f"UI populated with {len(entries)} entries.")
+        else:
+            st.session_state.document_entries = []
+            if not IS_ON_HF:
+                st.info("Manifest is empty for this namespace.")
+            logger.debug("No document entries returned; state cleared.")
+
         st.session_state.metadata_display_doc_name = None
 
     all_document_names = st.session_state.get("all_document_names", [])
 
+    st.subheader("Search loaded documents")
+
     search_query = st.text_input(
-        "Filter loaded documents by name:",
+        "",
         key="doc_search_input",
         help="Type to filter the list of loaded documents.",
-        value="",
+        placeholder="Search by file name...",
+        label_visibility="collapsed",
     )
 
-    # Filter against the already normalized document names
     filtered_document_names = [
         name for name in all_document_names if search_query.lower() in name.lower()
     ]
 
     if filtered_document_names:
-        st.write(
-            f"Displaying {len(filtered_document_names)} of {len(all_document_names)} loaded documents:"
+        st.markdown(
+            f"""
+            <p style="margin-bottom:0.4rem;color:#475569;">
+                Showing {len(filtered_document_names)} of {len(all_document_names)} document names
+            </p>
+            """,
+            unsafe_allow_html=True,
         )
         for doc_name in filtered_document_names:
-            with st.expander(f"📄 **{doc_name}**"):
+            with st.expander(f"📄 {doc_name}", expanded=False):
                 col_view, col_delete = st.columns([1, 1])
                 with col_view:
                     if st.button(f"View Metadata", key=f"view_meta_{doc_name}"):
@@ -2360,33 +2699,26 @@ def manage_documents_ui(
 
         if st.session_state.metadata_display_doc_name:
             st.markdown("---")
-            st.subheader(
-                f"Metadata for: `{st.session_state.metadata_display_doc_name}`"
-            )
-            st.info(
-                "Displaying metadata from a single representative chunk. Full document metadata may vary across chunks."
+            st.markdown(
+                f"""
+                <div style="border:1px solid #c7d2fe;background:#eef2ff;border-radius:16px;padding:1rem 1.3rem;margin-bottom:1rem;">
+                    <h3 style="margin:0;color:#1d4ed8;">Metadata for: <code>{st.session_state.metadata_display_doc_name}</code></h3>
+                    <p style="margin:0.4rem 0 0;color:#1e293b;font-size:0.9rem;">
+                        Displaying metadata from a single representative chunk. Full document metadata may vary across chunks.
+                    </p>
+                </div>
+                """,
+                unsafe_allow_html=True,
             )
             if index:
                 try:
-                    # Use the normalized display name for the filter
                     normalized_display_name_for_filter = (
                         st.session_state.metadata_display_doc_name.lower()
                     )
-                    query_filter = {"file_name": normalized_display_name_for_filter}
-                    # Heuristic to check if it's likely a document_id (SHA256 hash)
-                    if (
-                        "_" not in st.session_state.metadata_display_doc_name
-                        and len(st.session_state.metadata_display_doc_name) == 64
-                        and all(
-                            c in "0123456789abcdef"
-                            for c in st.session_state.metadata_display_doc_name.lower()
-                        )
-                    ):
-                        query_filter = {
-                            "document_id": st.session_state.metadata_display_doc_name
-                        }
-
-                    entries = _load_manifest()
+                    if IS_ON_HF:
+                        entries = st.session_state.get("document_entries", [])
+                    else:
+                        entries = _load_manifest()
                     matching_entry = next(
                         (
                             e
@@ -2397,23 +2729,43 @@ def manage_documents_ui(
                         ),
                         None,
                     )
+
                     if not matching_entry:
                         st.warning("Document not found in manifest.")
                     else:
                         doc_id = matching_entry["document_id"]
+                        query_response = None
                         try:
-                            probe_vector = [0.0] * embedding_dimension
-                            if probe_vector:
-                                probe_vector[0] = 1e-6
+                            actual_dimension = None
+                            try:
+                                describe_response = pc.describe_index(pinecone_index_name)
+                                if isinstance(describe_response, dict):
+                                    actual_dimension = describe_response.get("dimension")
+                                else:
+                                    actual_dimension = getattr(describe_response, "dimension", None)
+                            except Exception as describe_err:
+                                logger.warning(f"Could not confirm index dimension: {describe_err}")
 
-                            query_response = index.query(
-                                namespace=(namespace or None),
-                                filter={"document_id": doc_id},
-                                top_k=1,
-                                include_metadata=True,
-                                include_values=False,
-                                vector=probe_vector,
-                            )
+                            if actual_dimension and actual_dimension != embedding_dimension:
+                                st.warning(
+                                    f"Index '{pinecone_index_name}' uses dimension {actual_dimension}, "
+                                    f"but the configuration form is set to {embedding_dimension}. "
+                                    "Update the configuration to match before viewing metadata."
+                                )
+                            else:
+                                vector_dimension = actual_dimension or embedding_dimension
+                                probe_vector = [0.0] * vector_dimension
+                                if probe_vector:
+                                    probe_vector[0] = 1e-6
+
+                                query_response = index.query(
+                                    namespace=(namespace or None),
+                                    filter={"document_id": doc_id},
+                                    top_k=1,
+                                    include_metadata=True,
+                                    include_values=False,
+                                    vector=probe_vector,
+                                )
 
                         except Exception as e:
                             st.error(f"Metadata query failed: {e}")
@@ -2421,18 +2773,24 @@ def manage_documents_ui(
                                 f"Metadata query failed for document_id '{doc_id}': {e}"
                             )
                         else:
-                            matches = getattr(
-                                query_response, "matches", None
-                            ) or query_response.get("matches", [])
-                            if matches and matches[0].metadata:
-                                st.json(matches[0].metadata)
+                            if query_response is None:
+                                st.info(
+                                    "Metadata lookup skipped because the index dimension does not match the configured embedding dimension."
+                                )
                             else:
-                                st.warning(
-                                    "No metadata found for this document (0 matching chunks)."
-                                )
-                                logger.warning(
-                                    f"No chunk metadata returned for document '{st.session_state.metadata_display_doc_name}'."
-                                )
+                                matches = getattr(
+                                    query_response, "matches", None
+                                ) or query_response.get("matches", [])
+                                if matches and matches[0].metadata:
+                                    st.json(matches[0].metadata)
+                                else:
+                                    st.warning(
+                                        "No metadata found for this document (0 matching chunks)."
+                                    )
+                                    logger.warning(
+                                        f"No chunk metadata returned for document '{st.session_state.metadata_display_doc_name}'."
+                                    )
+
                 except Exception as e:
                     logger.exception(
                         f"Error fetching metadata for '{st.session_state.metadata_display_doc_name}'."
@@ -2445,13 +2803,27 @@ def manage_documents_ui(
 
     st.markdown("---")
     st.subheader("Delete Specific Document by Name or ID")
+    st.markdown(
+        """
+        <div style="border:1px solid #fee2e2;background:#fef2f2;border-radius:16px;padding:1rem 1.2rem;margin-bottom:1rem;">
+            <p style="margin:0;color:#991b1b;font-size:0.9rem;">
+                Enter the exact <strong>file_name</strong> (normalized to lowercase) or a full <strong>document_id</strong> (SHA256 hash) to remove all associated vectors.
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
     doc_name_or_id_to_delete = st.text_input(
-        "Enter Document Name or Document ID to Delete (case-sensitive)",
+        "",
         key="direct_delete_input",
-        help="Enter the exact 'file_name' or 'document_id' of a document to delete its associated vectors. This is useful if the document is not listed above or if you want to delete by its unique ID.",
+        help="Enter the exact 'file_name' or 'document_id' of a document to delete its associated vectors.",
+        placeholder="e.g., contract_v3.pdf or 8f14e45fceea167a5a36dedd4bea2543...",
+        label_visibility="collapsed",
     )
     if st.button(
-        "Initiate Deletion for Specific Document", key="initiate_direct_delete_button"
+        "Initiate Deletion for Specific Document",
+        key="initiate_direct_delete_button",
+        use_container_width=True,
     ):
         if doc_name_or_id_to_delete:
             if len(doc_name_or_id_to_delete) == 64 and all(
@@ -2463,7 +2835,6 @@ def manage_documents_ui(
                     f"Deletion staged for specific document ID: {doc_name_or_id_to_delete}"
                 )
             else:
-                # Normalize user input for file_name deletion
                 st.session_state.file_to_delete_staged = (
                     doc_name_or_id_to_delete.lower()
                 )
@@ -2478,11 +2849,28 @@ def manage_documents_ui(
 
     st.markdown("---")
     st.subheader("Bulk Actions")
-    st.write("Perform actions on all documents within the current namespace.")
+    st.markdown(
+        f"""
+        <div style="border:1px solid #fee2e2;background:#fff7ed;border-radius:16px;padding:1rem 1.3rem;margin-bottom:1rem;">
+            <div style="display:flex;flex-wrap:wrap;gap:1rem;align-items:center;justify-content:space-between;">
+                <div>
+                    <p style="margin:0;color:#9a3412;font-size:0.92rem;">
+                        Permanently delete <strong>all documents</strong> from index <code>{pinecone_index_name or 'N/A'}</code>
+                        in namespace <code>{namespace or 'default'}</code>. This cannot be undone.
+                    </p>
+                </div>
+                <div style="flex:0 0 auto;">
+                    """,
+        unsafe_allow_html=True,
+    )
+    bulk_delete_clicked = st.button(
+        "Delete ALL documents in this namespace",
+        key="bulk_delete_namespace_button",
+        use_container_width=True,
+    )
+    st.markdown("</div></div>", unsafe_allow_html=True)
 
-    if st.button(
-        "Delete ALL documents in current namespace", key="bulk_delete_namespace_button"
-    ):
+    if bulk_delete_clicked:
         st.session_state.bulk_delete_pending = True
         logger.info(
             f"Bulk deletion for namespace '{namespace or '__default__'}' prepared."
@@ -2492,10 +2880,18 @@ def manage_documents_ui(
     if st.session_state.bulk_delete_pending:
         st.markdown("---")
         st.subheader("Confirm Bulk Deletion")
-        st.error(
-            f"WARNING: You are about to permanently delete ALL documents from Pinecone index `{pinecone_index_name}` in namespace `'{namespace or '__default__'}'`."
+        st.markdown(
+            f"""
+            <div style="border:1px solid #fecaca;background:#fef2f2;border-radius:16px;padding:1rem 1.3rem;margin-bottom:1rem;">
+                <p style="margin:0;color:#991b1b;font-size:0.95rem;">
+                    🚨 You are about to permanently delete <strong>all documents</strong> from Pinecone index 
+                    <code>{pinecone_index_name}</code> in namespace <code>{namespace or '__default__'}</code>.
+                </p>
+                <p style="margin:0.4rem 0 0;color:#7f1d1d;font-size:0.88rem;">This action cannot be undone.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
-        st.write("This action cannot be undone.")
 
         bulk_confirm_checkbox = st.checkbox(
             "I understand this will delete ALL vectors in the current namespace permanently.",
@@ -2509,6 +2905,7 @@ def manage_documents_ui(
                 "Execute BULK Deletion",
                 key="execute_bulk_delete_button",
                 disabled=not bulk_confirm_checkbox,
+                use_container_width=True,
             ):
                 logger.info(
                     f"Execute BULK Deletion button clicked for namespace '{namespace or '__default__'}'."
@@ -2543,7 +2940,11 @@ def manage_documents_ui(
                     st.session_state.bulk_delete_pending = False
                     st.rerun()
         with col_bulk_cancel:
-            if st.button("Cancel Bulk Deletion", key="cancel_bulk_delete_button"):
+            if st.button(
+                "Cancel Bulk Deletion",
+                key="cancel_bulk_delete_button",
+                use_container_width=True,
+            ):
                 st.session_state.bulk_delete_pending = False
                 st.info("Bulk deletion cancelled.")
                 logger.info("Bulk deletion cancelled by user.")
@@ -2552,14 +2953,26 @@ def manage_documents_ui(
     if st.session_state.delete_pending:
         st.markdown("---")
         st.subheader("Confirm Document Deletion")
-        st.warning(f"You are about to permanently delete records for:")
-        if st.session_state.file_to_delete_staged:
-            st.write(f"- **File Name:** `{st.session_state.file_to_delete_staged}`")
-        if st.session_state.docid_to_delete_staged:
-            st.write(f"- **Document ID:** `{st.session_state.docid_to_delete_staged}`")
-        st.write(
-            f"From Pinecone index `{pinecone_index_name}` in namespace `'{namespace or '__default__'}'`."
+        st.markdown(
+            f"""
+            <div style="border:1px solid #fed7aa;background:#fff7ed;border-radius:16px;padding:1rem 1.3rem;margin-bottom:1rem;">
+                <p style="margin:0;color:#9a3412;font-size:0.95rem;">
+                    ⚠️ You are about to permanently delete records in Pinecone index <code>{pinecone_index_name}</code> (namespace <code>{namespace or '__default__'}</code>).
+                </p>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
+        if st.session_state.file_to_delete_staged:
+            st.markdown(
+                f"<p style='margin:0 0 0.2rem;color:#7c2d12;'>• <strong>File Name:</strong> <code>{st.session_state.file_to_delete_staged}</code></p>",
+                unsafe_allow_html=True,
+            )
+        if st.session_state.docid_to_delete_staged:
+            st.markdown(
+                f"<p style='margin:0 0 0.2rem;color:#7c2d12;'>• <strong>Document ID:</strong> <code>{st.session_state.docid_to_delete_staged}</code></p>",
+                unsafe_allow_html=True,
+            )
 
         confirm_checkbox = st.checkbox(
             "I understand this action is permanent and cannot be undone.",
@@ -2573,6 +2986,7 @@ def manage_documents_ui(
                 "Execute Deletion",
                 key="execute_delete_button",
                 disabled=not confirm_checkbox,
+                use_container_width=True,
             ):
                 logger.info("Execute Deletion button clicked.")
                 file_to_delete = st.session_state.file_to_delete_staged
@@ -2654,16 +3068,22 @@ def manage_documents_ui(
 
                     try:
                         stats_after = index.describe_index_stats()
-                        st.info(f"Index stats (after delete):")
-                        st.json(stats_after.to_dict())
+                        stats_after_dict = (
+                            stats_after.to_dict()
+                            if hasattr(stats_after, "to_dict")
+                            else stats_after
+                        )
+                        st.info("Index stats (after delete):")
+                        st.json(stats_after_dict)
                         logger.info(
-                            f"Retrieved index stats after deletion: {stats_after.to_dict()}"
+                            f"Retrieved index stats after deletion: {stats_after_dict}"
                         )
                     except Exception as e:
                         logger.exception(
                             "Failed to retrieve index stats after deletion."
                         )
                         st.info(f"Index stats unavailable after delete: {e}")
+
                 except Exception as e:
                     logger.exception("Delete operation failed.")
                     st.error(f"Delete operation failed: {e}")
@@ -2674,7 +3094,11 @@ def manage_documents_ui(
                     st.rerun()
 
         with col_cancel:
-            if st.button("Cancel Deletion", key="cancel_delete_button"):
+            if st.button(
+                "Cancel Deletion",
+                key="cancel_delete_button",
+                use_container_width=True,
+            ):
                 st.session_state.delete_pending = False
                 st.session_state.file_to_delete_staged = ""
                 st.session_state.docid_to_delete_staged = ""
@@ -2698,20 +3122,50 @@ def main():
         layout="wide",
         initial_sidebar_state="auto",
     )
+
     st.title("📚 Pinecone Ingestor")
-    st.markdown(
-        """
-        This tool helps you build and manage a Retrieval-Augmented Generation (RAG) knowledge base
-        by ingesting your documents into a Pinecone vector database.
-        """
+    st.write(
+        "Transform your files into a searchable AI knowledge base. "
+        "Upload documents, tune processing behavior, and upsert directly into Pinecone—without writing a single line of code."
     )
+    st.markdown(
+        "- **Smart chunking:** Automatically segments your content for high-precision retrieval.\n"
+        "- **Resilient uploads:** Resume failed ingestions without re-spending token costs.\n"
+        "- **Privacy-aware:** API keys stay on your device when running in the cloud."
+    )
+    st.markdown("---")
 
     load_dotenv()  # Load environment variables from .env file
-    current_logging_level_name = os.environ.get(
+    # Determine level from UI session state if it exists, otherwise environment
+    stored_level = st.session_state.get("logging_level_selected")
+    current_logging_level_name = stored_level if stored_level else os.environ.get(
         "LOGGING_LEVEL", DEFAULT_SETTINGS["LOGGING_LEVEL"]
-    )
-    logger = setup_logging_once(level=logging.getLevelName(current_logging_level_name))
+    )   
+    level_mapping = logging.getLevelNamesMapping()
+    target_level_int = level_mapping.get(current_logging_level_name, logging.INFO)
+    
+    logger = setup_logging_once(level=target_level_int)
     logger.info("Environment variables loaded from .env (if present).")
+
+    # --- BROWSER HYDRATION (HF ONLY) ---
+    if IS_ON_HF:
+        # 1. Check for payload FIRST (regardless of flag)
+        if "config_payload" in st.query_params:
+            try:
+                payload = json.loads(st.query_params["config_payload"])
+                if isinstance(payload, dict):
+                    logger.info("Hydrating session state from browser storage...")
+                    for key, value in payload.items():
+                        os.environ[key] = str(value)
+                    st.toast("Settings restored from browser cache", icon="🔄")
+                
+                st.session_state.browser_hydrated = True
+                st.query_params.clear()
+            except Exception as e:
+                logger.error(f"Hydration failed: {e}")
+                st.session_state.browser_hydrated = True 
+        
+        sync_browser_storage(action="load")
 
     # Load SpaCy model for NER filtering, caching it for performance
     nlp = load_spacy_model()
@@ -2731,6 +3185,10 @@ def main():
         st.session_state.show_reset_dialog = False
     if "config_form_key" not in st.session_state:
         st.session_state.config_form_key = 0
+    if "document_specific_metadata_map" not in st.session_state:
+        st.session_state.document_specific_metadata_map = {}
+    if "document_metadata_file_signature" not in st.session_state:
+        st.session_state.document_metadata_file_signature = None
 
     if "dynamic_metadata_fields" not in st.session_state:
         env_metadata = os.environ.get(
@@ -2746,11 +3204,67 @@ def main():
         if not st.session_state.dynamic_metadata_fields:
             st.session_state.dynamic_metadata_fields.append({"key": "", "value": ""})
 
-    st.markdown("---")
+
     st.header("1. Configuration")
     st.write(
         "Set up your API keys, Pinecone index details, and document processing parameters."
     )
+
+    port_col1, port_col2 = st.columns(2)
+    with port_col1:
+        st.markdown("**📤 Export current settings**")
+        st.caption("Download the configuration currently stored in your environment or browser cache.")
+        # EXPORT LOGIC:
+        export_data = {
+            "PINECONE_API_KEY": os.environ.get("PINECONE_API_KEY", ""),
+            "EMBEDDING_API_KEY": os.environ.get("EMBEDDING_API_KEY", ""),
+            "PINECONE_INDEX_NAME": os.environ.get("PINECONE_INDEX_NAME", ""),
+            "PINECONE_CLOUD_REGION": os.environ.get("PINECONE_CLOUD_REGION", "aws-us-east-1"),
+            "EMBEDDING_MODEL_NAME": os.environ.get("EMBEDDING_MODEL_NAME", "text-embedding-3-small"),
+            "EMBEDDING_DIMENSION": os.environ.get("EMBEDDING_DIMENSION", "1536"),
+            "METRIC_TYPE": os.environ.get("METRIC_TYPE", "cosine"),
+            "NAMESPACE": os.environ.get("NAMESPACE", ""),
+            "CHUNK_SIZE": os.environ.get("CHUNK_SIZE", "3600"),
+            "CHUNK_OVERLAP": os.environ.get("CHUNK_OVERLAP", "540"),
+            "CUSTOM_METADATA": os.environ.get("CUSTOM_METADATA", DEFAULT_SETTINGS["CUSTOM_METADATA"]),
+            "OVERWRITE_EXISTING_DOCS": os.environ.get("OVERWRITE_EXISTING_DOCS", "False"),
+            "LOGGING_LEVEL": os.environ.get("LOGGING_LEVEL", "INFO"),
+            "ENABLE_FILTERING": os.environ.get("ENABLE_FILTERING", "True"),
+            "WHITELISTED_KEYWORDS": os.environ.get("WHITELISTED_KEYWORDS", ""),
+            "MIN_GENERIC_CONTENT_LENGTH": os.environ.get("MIN_GENERIC_CONTENT_LENGTH", "150"),
+            "ENABLE_NER_FILTERING": os.environ.get("ENABLE_NER_FILTERING", "True"),
+            "UNSTRUCTURED_STRATEGY": os.environ.get("UNSTRUCTURED_STRATEGY", "fast"),
+            "SEMANTIC_CHUNKER_THRESHOLD_TYPE": os.environ.get("SEMANTIC_CHUNKER_THRESHOLD_TYPE", "percentile"),
+            "SEMANTIC_CHUNKER_THRESHOLD_AMOUNT": os.environ.get("SEMANTIC_CHUNKER_THRESHOLD_AMOUNT", "98.0"),
+            "MIN_CHILD_CHUNK_LENGTH": os.environ.get("MIN_CHILD_CHUNK_LENGTH", "100"),
+            "KEEP_LOW_CONFIDENCE_SNIPPETS": os.environ.get("KEEP_LOW_CONFIDENCE_SNIPPETS", "False"),
+        }
+        st.download_button(
+            label="Download profile (.json)",
+            data=json.dumps(export_data, indent=4),
+            file_name="pinecone_config_backup.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+
+    with port_col2:
+        st.markdown("**📥 Import settings from file**")
+        st.caption("Upload a JSON profile to instantly hydrate this form. You can review it before saving.")
+        uploaded_config = st.file_uploader(
+            "Upload Settings JSON",
+            type=["json"],
+            label_visibility="collapsed",
+        )
+        if uploaded_config is not None:
+            try:
+                import_payload = json.load(uploaded_config)
+                for k, v in import_payload.items():
+                    os.environ[k] = str(v)
+                if "CUSTOM_METADATA" in import_payload:
+                    st.session_state.dynamic_metadata_fields = json.loads(import_payload["CUSTOM_METADATA"])
+                st.success("✅ Settings imported to form! Click 'Save Configuration' below to persist.")
+            except Exception as e:
+                st.error(f"Failed to parse config: {e}")
 
     # Retrieve current API key values for pre-filling inputs and external button access
     pinecone_api_key_val = os.environ.get(
@@ -2759,10 +3273,40 @@ def main():
     embedding_api_key_val = os.environ.get(
         "EMBEDDING_API_KEY", DEFAULT_SETTINGS["EMBEDDING_API_KEY"]
     )
+    status_cols = st.columns(3)
+    status_config = [
+        ("Pinecone API Key", bool(pinecone_api_key_val)),
+        ("OpenAI API Key", bool(embedding_api_key_val)),
+        ("Index Name", bool(os.environ.get("PINECONE_INDEX_NAME", "").strip())),
+    ]
+    for col, (label, is_ready) in zip(status_cols, status_config):
+        with col:
+            st.caption(label)
+            if is_ready:
+                st.success("Ready")
+            else:
+                st.error("Missing")
+
+    st.markdown(" ")
 
     with st.form(key=f"config_form_{st.session_state.config_form_key}"):
         # API Keys section within an expander for sensitive information
-        with st.expander("🔑 API Keys (Sensitive)", expanded=True):
+        api_card = st.container()
+        with api_card:
+            st.markdown(
+                """
+                <div style="background:linear-gradient(125deg,#0f172a,#1e3a8a);border-radius:18px;padding:1.2rem 1.4rem;margin-bottom:1.2rem;color:white;">
+                    <div style="display:flex;align-items:center;justify-content:space-between;gap:0.6rem;flex-wrap:wrap;">
+                        <div>
+                            <h3 style="margin:0;">🔑 Secure Connections</h3>
+                            <p style="margin:0;font-size:0.92rem;opacity:0.9;">Keys are encrypted in flight. On Hugging Face, they remain in your browser storage only.</p>
+                        </div>
+                        <span style="background:rgba(255,255,255,0.16);padding:0.35rem 0.9rem;border-radius:999px;font-size:0.85rem;">Never logged or shared</span>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
             pinecone_api_key = st.text_input(
                 "Pinecone API Key",
                 type="password",
@@ -2777,212 +3321,242 @@ def main():
             )
 
         st.subheader("Index & Model Settings")
-        pinecone_index_name = st.text_input(
-            "Pinecone Index Name",
-            value=os.environ.get(
-                "PINECONE_INDEX_NAME", DEFAULT_SETTINGS["PINECONE_INDEX_NAME"]
-            ),
-            help="The name of the Pinecone index where your vectors will be stored. Choose a unique name.",
-        )
+        col_idx_left, col_idx_right = st.columns(2)
 
-        region_options = list(SUPPORTED_PINECONE_REGIONS.keys())
-        current_region = os.environ.get(
-            "PINECONE_CLOUD_REGION", DEFAULT_SETTINGS["PINECONE_CLOUD_REGION"]
-        )
-        default_region_index = (
-            region_options.index(current_region)
-            if current_region in region_options
-            else 0
-        )
-        pinecone_cloud_region = st.selectbox(
-            "Pinecone Cloud Region",
-            options=region_options,
-            index=default_region_index,
-            help=(
-                "Select the cloud provider and region where your Pinecone index will be hosted. "
-                "Free tier supports only 'aws-us-east-1'. Choose accordingly."
-            ),
-        )
-
-        embedding_model_name = st.text_input(
-            "Embedding Model Name",
-            value=os.environ.get(
-                "EMBEDDING_MODEL_NAME", DEFAULT_SETTINGS["EMBEDDING_MODEL_NAME"]
-            ),
-            help="The embedding model identifier (e.g., 'text-embedding-3-small'). Choose based on your provider's available models.",
-        )
-        embedding_dimension = st.number_input(
-            "Embedding Dimension",
-            min_value=1,
-            value=int(
-                os.environ.get(
-                    "EMBEDDING_DIMENSION", DEFAULT_SETTINGS["EMBEDDING_DIMENSION"]
-                )
-            ),
-            help="Dimensionality of the embedding vectors. Typically 1536 for 'text-embedding-3-small'.",
-        )
-        metric_type = st.selectbox(
-            "Pinecone Metric Type",
-            options=["cosine", "euclidean", "dotproduct"],
-            index=["cosine", "euclidean", "dotproduct"].index(
-                os.environ.get("METRIC_TYPE", DEFAULT_SETTINGS["METRIC_TYPE"])
-            ),
-            help=(
-                "Similarity metric used by Pinecone for vector search. "
-                "'cosine' is common for semantic similarity. Choose based on your embedding model's training."
-            ),
-        )
-        namespace = st.text_input(
-            "Namespace (Optional)",
-            value=os.environ.get("NAMESPACE", DEFAULT_SETTINGS["NAMESPACE"]),
-            help=(
-                "Optional partition within the Pinecone index to isolate data (e.g., per customer or project). "
-                "Leave blank to use the default namespace."
-            ),
-        )
-
-        st.subheader("Document Processing Settings")
-
-        # Unstructured Loader Strategy selection
-        unstructured_strategy_options = ["hi_res", "fast", "auto"]
-        current_unstructured_strategy = os.environ.get(
-            "UNSTRUCTURED_STRATEGY", DEFAULT_SETTINGS["UNSTRUCTURED_STRATEGY"]
-        )
-        default_strategy_index = (
-            unstructured_strategy_options.index(current_unstructured_strategy)
-            if current_unstructured_strategy in unstructured_strategy_options
-            else 0
-        )
-        unstructured_strategy = st.selectbox(
-            "Unstructured Loader Strategy",
-            options=unstructured_strategy_options,
-            index=default_strategy_index,
-            help=(
-                "Select the strategy for Unstructured.io document parsing: "
-                "'hi_res' (high-resolution, slower, more accurate), "
-                "'fast' (quicker, less accurate), or "
-                "'auto' (Unstructured decides based on document type)."
-            ),
-        )
-
-        chunk_size = st.number_input(
-            "Chunk Size (characters)",
-            min_value=256,
-            value=int(os.environ.get("CHUNK_SIZE", DEFAULT_SETTINGS["CHUNK_SIZE"])),
-            help=(
-                "Maximum size of each text chunk to embed, measured in characters. "
-                "This will be dynamically adjusted if needed to fit Pinecone's metadata limit."
-            ),
-        )
-        chunk_overlap = st.number_input(
-            "Chunk Overlap (characters)",
-            min_value=0,
-            value=int(
-                os.environ.get("CHUNK_OVERLAP", DEFAULT_SETTINGS["CHUNK_OVERLAP"])
-            ),
-            help=(
-                "Number of characters overlapping between consecutive chunks to maintain context. "
-                "Typical values are 100-200."
-            ),
-        )
-
-        # Content Filtering Settings
-        st.subheader("Filtering Settings")
-        enable_filtering = st.checkbox(
-            "Enable Content Filtering",
-            value=(os.environ.get("ENABLE_FILTERING", "True").lower() == "true"),
-            help=(
-                "Disable to keep all extracted text, regardless of length or category. "
-                "Use with caution as it may introduce noise and increase costs."
-            ),
-            key="config_enable_filtering_checkbox",
-        )
-
-        keep_low_confidence = st.checkbox(
-            "Keep short low-confidence snippets?",
-            value=(
-                os.environ.get("KEEP_LOW_CONFIDENCE_SNIPPETS", "False").lower()
-                == "true"
-            ),
-            help=(
-                "Leave unchecked to drop very short, non-whitelisted text (recommended). "
-                "Enable for verse-like corpora where short lines carry meaning."
-            ),
-            key="config_keep_low_confidence_checkbox",
-        )
-
-        whitelisted_keywords_input = st.text_input(
-            "Whitelisted Keywords (comma-separated)",
-            value=os.environ.get(
-                "WHITELISTED_KEYWORDS", DEFAULT_SETTINGS["WHITELISTED_KEYWORDS"]
-            ),
-            help=(
-                "Enter words or short phrases that should always be kept, even if short or generic. "
-                "E.g., 'Error Code', 'API Key', 'Product ID'. Case-insensitive matching."
-            ),
-            key="config_whitelisted_keywords_input",
-        )
-        min_generic_content_length_ui = st.number_input(
-            "Min Length for Generic Content (characters)",
-            min_value=0,
-            value=int(
-                os.environ.get(
-                    "MIN_GENERIC_CONTENT_LENGTH",
-                    DEFAULT_SETTINGS["MIN_GENERIC_CONTENT_LENGTH"],
-                )
-            ),
-            help=(
-                "Minimum character length for generic text segments to be included. "
-                "Text shorter than this, and not categorized as important or whitelisted, will be filtered out. "
-                "A lower value may capture more short facts but could introduce noise."
-            ),
-            key="config_min_generic_content_length_input",
-        )
-        enable_ner_filtering = st.checkbox(
-            "Enable NER Filtering for Short Generic Content",
-            value=st.session_state.get(
-                "enable_ner_filtering",
-                DEFAULT_SETTINGS["ENABLE_NER_FILTERING"].lower() == "true",
-            ),
-            help=(
-                "If enabled, short generic text (below min length) will be kept if it contains recognized Named Entities (e.g., dates, organizations, persons). "
-                "Requires SpaCy 'en_core_web_sm' model. NER filtering is automatically disabled if SpaCy model fails to load."
-            ),
-            disabled=(nlp is None),
-            key="config_enable_ner_filtering_checkbox",
-        )
-        if enable_ner_filtering and nlp is None:
-            st.warning(
-                "SpaCy 'en_core_web_sm' model is required for NER filtering but failed to load. Please install it using `python -m spacy download en_core_web_sm` and restart the app."
+        with col_idx_left:
+            pinecone_index_name = st.text_input(
+                "Pinecone Index Name",
+                value=os.environ.get(
+                    "PINECONE_INDEX_NAME", DEFAULT_SETTINGS["PINECONE_INDEX_NAME"]
+                ),
+                help="The name of the Pinecone index where your vectors will be stored. Choose a unique name.",
             )
 
+            region_options = list(SUPPORTED_PINECONE_REGIONS.keys())
+            current_region = os.environ.get(
+                "PINECONE_CLOUD_REGION", DEFAULT_SETTINGS["PINECONE_CLOUD_REGION"]
+            )
+            default_region_index = (
+                region_options.index(current_region)
+                if current_region in region_options
+                else 0
+            )
+            pinecone_cloud_region = st.selectbox(
+                "Pinecone Cloud Region",
+                options=region_options,
+                index=default_region_index,
+                help=(
+                    "Select the cloud provider and region where your Pinecone index will be hosted. "
+                    "Free tier supports only 'aws-us-east-1'. Choose accordingly."
+                ),
+            )
+
+            namespace = st.text_input(
+                "Namespace (Optional)",
+                value=os.environ.get("NAMESPACE", DEFAULT_SETTINGS["NAMESPACE"]),
+                help=(
+                    "Optional: A label to group documents together. This allows you to "
+                    "search only specific subsets of your data later (e.g., 'LegalDocs' or 'Client_A'). "
+                    "Leave blank to use the default namespace."
+                ),
+            )
+
+        with col_idx_right:
+            embedding_model_name = st.text_input(
+                "OpenAI Embedding Model Name",
+                value=os.environ.get(
+                    "EMBEDDING_MODEL_NAME", DEFAULT_SETTINGS["EMBEDDING_MODEL_NAME"]
+                ),
+                help="The specific OpenAI embedding model to use (e.g., 'text-embedding-3-small').",
+            )
+            embedding_dimension = st.number_input(
+                "Embedding Dimension",
+                min_value=1,
+                value=int(
+                    os.environ.get(
+                        "EMBEDDING_DIMENSION", DEFAULT_SETTINGS["EMBEDDING_DIMENSION"]
+                    )
+                ),
+                help="Dimensionality of the embedding vectors. Typically 1536 for 'text-embedding-3-small' and 3072 for 'text-embedding-3-large'.",
+            )
+            metric_type = st.selectbox(
+                "Pinecone Metric Type",
+                options=["cosine", "euclidean", "dotproduct"],
+                index=["cosine", "euclidean", "dotproduct"].index(
+                    os.environ.get("METRIC_TYPE", DEFAULT_SETTINGS["METRIC_TYPE"])
+                ),
+                help=(
+                    "Similarity metric used by Pinecone for vector search. "
+                    "'Cosine' is the standard and recommended setting for most AI applications."
+                ),
+            )
+
+        st.subheader("Document Processing Settings")
+        proc_col_left, proc_col_right = st.columns(2)
+
+        with proc_col_left:
+            unstructured_strategy_options = ["hi_res", "fast", "auto"]
+            current_unstructured_strategy = os.environ.get(
+                "UNSTRUCTURED_STRATEGY", DEFAULT_SETTINGS["UNSTRUCTURED_STRATEGY"]
+            )
+            default_strategy_index = (
+                unstructured_strategy_options.index(current_unstructured_strategy)
+                if current_unstructured_strategy in unstructured_strategy_options
+                else 0
+            )
+            unstructured_strategy = st.selectbox(
+                "Document Scanning Precision",
+                options=unstructured_strategy_options,
+                index=default_strategy_index,
+                help=(
+                    "Choose how thoroughly to scan your files. "
+                    "'hi_res' is recommended for complex PDFs with tables or images. "
+                    "'fast' is best for simple text files. "
+                    "'auto' lets the system choose."
+                ),
+            )
+
+            chunk_size = st.number_input(
+                "Search Segment Size (Characters)",
+                min_value=256,
+                value=int(os.environ.get("CHUNK_SIZE", DEFAULT_SETTINGS["CHUNK_SIZE"])),
+                help=(
+                    "Documents are broken into smaller segments so the AI can find specific answers. "
+                    "Larger segments provide more context, while smaller segments are more precise."
+                ),
+            )
+            chunk_overlap = st.number_input(
+                "Topic Continuity (Overlap)",
+                min_value=0,
+                value=int(
+                    os.environ.get("CHUNK_OVERLAP", DEFAULT_SETTINGS["CHUNK_OVERLAP"])
+                ),
+                help=(
+                    "The number of characters repeated between segments. This ensures that a "
+                    "sentence or topic isn't accidentally cut in half at the edge of a segment."
+                ),
+            )
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        with proc_col_right:
+
+
+            whitelisted_keywords_input = st.text_input(
+                "Whitelisted Keywords (comma-separated)",
+                value=os.environ.get(
+                    "WHITELISTED_KEYWORDS",
+                    DEFAULT_SETTINGS["WHITELISTED_KEYWORDS"],
+                ),
+                help=(
+                    "If a segment of text is very short but contains one of these words, "
+                    "it will NOT be deleted. Useful for unique codes or product names."
+                ),
+                key="config_whitelisted_keywords_input",
+            )
+            min_generic_content_length_ui = st.number_input(
+                "Minimum Segment Length (characters)",
+                min_value=0,
+                value=int(
+                    os.environ.get(
+                        "MIN_GENERIC_CONTENT_LENGTH",
+                        DEFAULT_SETTINGS["MIN_GENERIC_CONTENT_LENGTH"],
+                    )
+                ),
+                help=(
+                    "The smallest number of characters required for a section to be kept. "
+                    "Text shorter than this will be discarded unless it contains a name, date, or whitelisted keyword."
+                ),
+                key="config_min_generic_content_length_input",
+            )
+            enable_filtering = st.checkbox(
+                "Enable Content Filtering",
+                value=(os.environ.get("ENABLE_FILTERING", "True").lower() == "true"),
+                help=(
+                    "Removes background noise, headers/footers, and irrelevant fragments. "
+                    "Disable to keep all extracted text, regardless of length or category."
+                ),
+                key="config_enable_filtering_checkbox",
+            )
+
+            keep_low_confidence = st.checkbox(
+                "Preserve Short Fragments",
+                value=(
+                    os.environ.get("KEEP_LOW_CONFIDENCE_SNIPPETS", "False").lower()
+                    == "true"
+                ),
+                help=(
+                    "Keep very short lines of text that the system might otherwise ignore. "
+                    "Enable this if you are uploading poetry, scripts, or itemized lists."
+                ),
+                key="config_keep_low_confidence_checkbox",
+            )
+            enable_ner_filtering = st.checkbox(
+                "Smart Entity Protection",
+                value=st.session_state.get(
+                    "enable_ner_filtering",
+                    DEFAULT_SETTINGS["ENABLE_NER_FILTERING"].lower() == "true",
+                ),
+                help=(
+                    "Prevents the system from deleting short lines that contain important "
+                    "identifiers like People, Organizations, or Dates. "
+                    "Requires the SpaCy AI model to be loaded."
+                ),
+                disabled=(nlp is None),
+                key="config_enable_ner_filtering_checkbox",
+            )
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        st.subheader("Custom Metadata (Optional)")
+        st.caption(
+            "Attach a CSV or JSON file containing per-document tags such as author, department, or access level. "
+            "Must include a 'file_name' column/key."
+        )
         document_metadata_file = st.file_uploader(
-            "Upload Document-Specific Metadata (CSV/JSON, optional)",
+            label="Attach metadata file (.csv or .json)",
             type=["csv", "json"],
             accept_multiple_files=False,
-            help=(
-                "Upload a CSV or JSON file containing metadata for individual documents. "
-                "For CSV, include a 'file_name' column. For JSON, use an array of objects with a 'file_name' key. "
-                "This metadata will override global settings for matching documents. "
-                f"Note: Reserved keys ({', '.join(RESERVED_METADATA_KEYS)}) will be ignored."
-            ),
+            label_visibility="collapsed",
         )
-
+        st.caption("Example structure")
+        st.table(
+            {
+                "file_name": ["contract.pdf", "handbook.docx"],
+                "author": ["Jane Doe", "Ops Team"],
+                "department": ["Legal", "HR"],
+            }
+        )
+        st.markdown(
+            """
+            <div style="border:1px solid #fcd34d;background:#fffbeb;border-radius:14px;padding:0.9rem 1.1rem;margin:1rem 0;">
+                <div style="display:flex;align-items:center;gap:0.6rem;">
+                    <span style="font-size:1.2rem;">⚠️</span>
+                    <div>
+                        <strong style="color:#713f12;">Overwrite Existing Documents?</strong>
+                        <p style="margin:0;color:#92400e;font-size:0.88rem;">Enable only if you want newer uploads to replace older versions when the file name is identical.</p>
+                    </div>
+                </div>
+            """,
+            unsafe_allow_html=True,
+        )
         overwrite_existing_docs = st.checkbox(
-            "Overwrite existing documents with the same file name?",
+            "Allow overwriting documents with the same file name",
             value=(
                 os.environ.get("OVERWRITE_EXISTING_DOCS", "False").lower() == "true"
             ),
             help=(
-                "If checked, any existing vectors in Pinecone associated with uploaded files (matched by file name) "
-                "will be deleted before new chunks are uploaded. Use with caution."
+                "If enabled, re-uploading a file with the same name will delete the old version "
+                "from your database and replace it with the new one. If disabled, the system "
+                "will skip files that are already present to prevent duplicates and save costs."
             ),
             key="config_overwrite_checkbox",
         )
+        st.markdown("</div>", unsafe_allow_html=True)
 
         with st.expander("⚙️ Advanced Chunking Settings", expanded=False):
-            st.markdown("---")
-            st.subheader("Semantic Chunking Parameters")
+            st.subheader("Automated Topic Discovery (Semantic Chunking)")
+            st.caption(
+                "Fine-tune how aggressively the system splits parent sections into smaller retrieval units."
+            )
             semantic_chunker_threshold_type_options = [
                 "percentile",
                 "standard_deviation",
@@ -3001,20 +3575,19 @@ def main():
                 else 0
             )
             semantic_chunker_threshold_type = st.selectbox(
-                "Semantic Split Threshold Type",
+                "Topic Separation Method",
                 options=semantic_chunker_threshold_type_options,
                 index=default_semantic_threshold_type_index,
                 help=(
-                    "Determines how semantic breakpoints are identified. "
-                    "'percentile': Splits at distances greater than a certain percentile of all distances (default 98). "
-                    "'standard_deviation': Splits at distances greater than X standard deviations from the mean (default 3). "
-                    "'interquartile': Uses interquartile range for splitting (default 1.5). "
-                    "'gradient': Applies anomaly detection on gradient array (default 98)."
+                    "This setting determines how the AI identifies a 'break' between two topics:\n\n"
+                    "• PERCENTILE (Recommended): Splits when the difference between sentences is in the top X% of all detected differences.\n"
+                    "• STANDARD DEVIATION: Splits when a difference is significantly above average.\n"
+                    "• INTERQUARTILE: Focuses on statistical outliers in the flow.\n"
+                    "• GRADIENT: Looks for abrupt meaning changes, good for highly structured docs."
                 ),
                 key="config_semantic_chunker_threshold_type",
             )
 
-            # Adjust min/max/value/step based on the selected type for better UX
             threshold_amount_min = 0.0
             threshold_amount_max = 100.0
             threshold_amount_value = 98.0
@@ -3037,39 +3610,41 @@ def main():
                 threshold_amount_step = 0.1
 
             semantic_chunker_threshold_amount = st.slider(
-                "Semantic Split Threshold Amount",
+                "Topic Transition Sensitivity",
                 min_value=threshold_amount_min,
                 max_value=threshold_amount_max,
                 value=float(
                     os.environ.get(
-                        "SEMANTIC_CHUNKER_THRESHOLD_AMOUNT", str(threshold_amount_value)
+                        "SEMANTIC_CHUNKER_THRESHOLD_AMOUNT",
+                        str(threshold_amount_value),
                     )
                 ),
                 step=threshold_amount_step,
                 format="%.1f",
                 help=(
-                    f"The specific value for the selected threshold type. "
-                    f"For '{semantic_chunker_threshold_type}', a higher value means fewer, larger chunks (more strict splitting)."
+                    "How sensitive the AI is to changes in topic. Higher values = fewer, larger sections. "
+                    "Lower values = more granular sections."
                 ),
                 key="config_semantic_chunker_threshold_amount",
             )
 
             min_child_chunk_length_ui = st.number_input(
-                "Minimum Semantic Child Chunk Length (characters)",
+                "Minimum Useful Segment Length (characters)",
                 min_value=1,
-                value=int(
-                    os.environ.get("MIN_CHILD_CHUNK_LENGTH", "100")
-                ),  # Default to 100 chars
+                value=int(os.environ.get("MIN_CHILD_CHUNK_LENGTH", "100")),
                 step=10,
                 help=(
-                    "The absolute minimum character length for any semantic child chunk. "
-                    "Chunks shorter than this will be skipped. This helps ensure embeddable chunks are meaningful."
+                    "Prevents the AI from creating segments that are too small to be useful. "
+                    "Shorter than this will be merged with neighbors."
                 ),
                 key="config_min_child_chunk_length",
             )
+            st.markdown("</div>", unsafe_allow_html=True)
 
         # Advanced Logging Settings
-        with st.expander("Advanced Logging Settings", expanded=False):
+        with st.expander("🔎 Advanced Logging Settings", expanded=False):
+            st.subheader("Control Log Verbosity")
+            st.caption("Adjust log noise for troubleshooting or production monitoring.")
             logging_level_options = ["DEBUG", "INFO", "WARNING", "ERROR"]
             current_logging_level_name_from_env = os.environ.get(
                 "LOGGING_LEVEL", DEFAULT_SETTINGS["LOGGING_LEVEL"]
@@ -3084,20 +3659,47 @@ def main():
                 options=logging_level_options,
                 index=default_logging_index,
                 help="Set the verbosity of the application logs. DEBUG is most verbose, ERROR is least verbose.",
+                key="logging_level_selected",
             )
 
-            if logging.getLevelName(logger.level) != logging_level_selected:
-                logger.setLevel(logging_level_selected)
+            current_level_name = logging.getLevelName(logger.level)
+            if current_level_name != logging_level_selected:
+                new_level_int = logging.getLevelNamesMapping().get(
+                    logging_level_selected, logging.INFO
+                )
+                logger.setLevel(new_level_int)
+                st.toast(f"Logger set to {logging_level_selected}", icon="🔧")
                 logger.info(
                     f"Logging level dynamically set to {logging_level_selected}."
                 )
+            st.markdown("</div>", unsafe_allow_html=True)
 
         # Form submission buttons
-        col1, col2 = st.columns(2)
-        with col1:
-            save_conf = st.form_submit_button("💾 Save Configuration (local .env)")
-        with col2:
-            reset_conf = st.form_submit_button("🔄 Reset to Defaults (local only)")
+        st.markdown(
+            """
+            <div style="display:flex;flex-wrap:wrap;gap:1rem;margin-top:1.4rem;">
+                <div style="flex:1;min-width:220px;">
+                """,
+            unsafe_allow_html=True,
+        )
+        save_conf = st.form_submit_button(
+            "✔️ Save Configuration",
+            use_container_width=True,
+        )
+        st.markdown(
+            """
+                </div>
+                <div style="flex:1;min-width:220px;">
+                """,
+            unsafe_allow_html=True,
+        )
+        reset_conf = st.form_submit_button(
+            "♻️ Reset to Defaults",
+            use_container_width=True,
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("</div>", unsafe_allow_html=True)
 
     # Guarantee runtime value is False when SpaCy isn't available
     enable_ner_filtering = bool(enable_ner_filtering and nlp is not None)
@@ -3111,10 +3713,10 @@ def main():
         test_api_connections(pinecone_api_key, embedding_api_key, logger)
 
     # Logic for saving configuration to .env file
+    # Logic for saving configuration
     if save_conf:
-        custom_metadata_json_string = json.dumps(
-            st.session_state.dynamic_metadata_fields
-        )
+        # 1. Prepare the settings payload
+        custom_metadata_json_string = json.dumps(st.session_state.dynamic_metadata_fields)
         to_save = {
             "PINECONE_API_KEY": pinecone_api_key,
             "EMBEDDING_API_KEY": embedding_api_key,
@@ -3139,23 +3741,32 @@ def main():
             "MIN_CHILD_CHUNK_LENGTH": str(min_child_chunk_length_ui),
             "KEEP_LOW_CONFIDENCE_SNIPPETS": str(keep_low_confidence),
         }
-
-        with open(".env", "w") as f:
-            for k, v in to_save.items():
-                f.write(f"{k}={v}\n")
-        for k, v in to_save.items():
-            os.environ[k] = v
-        st.success("Configuration saved locally to .env")
-        logger.info("Configuration saved locally to .env file.")
+        for key, value in to_save.items():
+            os.environ[key] = value
+        # 2. Handle Persistence based on environment
+        if not IS_ON_HF:
+            # Local: Save to .env
+            with open(".env", "w") as f:
+                for k, v in to_save.items():
+                    f.write(f"{k}={v}\n")
+            st.success("💾 Configuration saved locally to .env")
+        else:
+            # Hugging Face: Save to Browser Storage
+            sync_browser_storage(data=to_save, action="save")
+            st.success("✅ Configuration saved to your browser cache.")
+            time.sleep(1) # Give JS a moment to execute before rerun
+            
         st.rerun()
 
     # Logic for resetting configuration to defaults
-    if reset_conf and is_running_locally():
+    if reset_conf:
         st.session_state.show_reset_dialog = True
         st.rerun()
 
+
     if st.session_state.show_reset_dialog:
-        st.warning("Reset ALL configuration to defaults? (affects only local .env)")
+        warning_msg = "Reset ALL configuration to defaults? (affects only local .env)" if not IS_ON_HF else "Reset ALL configuration to defaults? (affects browser cache)"
+        st.warning(warning_msg)
         keep_keys = st.checkbox("Keep API keys?", value=True)
         if st.button("Confirm reset"):
             defaults = DEFAULT_SETTINGS.copy()
@@ -3168,16 +3779,27 @@ def main():
                 st.session_state.dynamic_metadata_fields
             )
 
-            with open(".env", "w") as f:
-                for k, v in defaults.items():
-                    f.write(f"{k}={v}\n")
+            if not IS_ON_HF:
+                # Local: Write defaults to .env
+                with open(".env", "w") as f:
+                    for k, v in defaults.items():
+                        f.write(f"{k}={v}\n")
+            else:
+                # Hugging Face: Save defaults to browser storage
+                sync_browser_storage(data=defaults, action="save")
+
+            # Update current environment memory
             for k, v in defaults.items():
                 os.environ[k] = v
+            
             st.session_state.show_reset_dialog = False
-            st.session_state.config_form_key += 1
-            st.success("Local configuration reset")
-            logger.info("Local configuration reset to defaults.")
+            st.session_state.config_form_key += 1          
+            success_msg = "Configuration reset" if not IS_ON_HF else "Browser cache reset"
+            st.success(success_msg)
+            logger.info(f"{success_msg} to defaults.")
+            time.sleep(1)
             st.rerun()
+
         if st.button("Cancel"):
             st.session_state.show_reset_dialog = False
             st.info("Reset cancelled")
@@ -3185,16 +3807,24 @@ def main():
             st.rerun()
 
     st.markdown("---")
-    st.subheader("Global Custom Metadata")
-    st.write(
-        "Define custom key-value pairs here. These will be added to all uploaded document chunks."
-    )
+    st.subheader("Global Custom Metadata (Tags)")
     st.info(
-        f"Note: Reserved keys ({', '.join(RESERVED_METADATA_KEYS)}) will be ignored or overwritten by internal values."
+        "Add metadata tags that will be attached to every document processed in this session. "
+        "Helpful for project names, departments, sensitivity level, etc."
     )
+
     st.markdown(
-        'Example: `{"project_name": "MyRAGProject", "department": "Engineering"}`'
+        f"""
+        <div style="border:1px solid #fee2e2;background:#fef2f2;border-radius:12px;padding:0.8rem 1rem;margin-bottom:0.8rem;">
+            <p style="margin:0;color:#991b1b;font-size:0.9rem;">
+                ⚠️ Some keys are reserved by the system and cannot be used: {', '.join(RESERVED_METADATA_KEYS)}.
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
+    st.caption("Example")
+    st.code('{"project_name": "MyRAGProject", "department": "Engineering"}', language="json")
 
     # Dynamic UI for adding/removing custom metadata fields
     for i, field in enumerate(st.session_state.dynamic_metadata_fields):
@@ -3238,15 +3868,46 @@ def main():
         ):
             st.session_state.dynamic_metadata_fields.pop()
             st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
     st.markdown("---")
 
     st.header("2. Upload Documents")
-    st.write(
-        "Upload your documents here to embed them and upsert into your Pinecone knowledge base."
+    st.markdown(
+        """
+        <div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:16px;padding:1rem 1.3rem;margin-bottom:1rem;">
+            <div style="display:flex;flex-wrap:wrap;justify-content:space-between;gap:0.8rem;">
+                <div style="flex:1;min-width:220px;">
+                    <p style="margin:0;color:#374151;font-size:0.95rem;">
+                        Upload files to embed them and upsert into your Pinecone knowledge base.
+                        You can resume failed ingestion runs without re-uploading or re-paying for embeddings.
+                    </p>
+                </div>
+                <div style="flex:0 0 auto;background:white;border:1px solid #d1d5db;border-radius:12px;padding:0.7rem 1rem;">
+                    <p style="margin:0;font-size:0.85rem;color:#111827;"><strong>Supported:</strong></p>
+                    <p style="margin:0;color:#4b5563;font-size:0.85rem;">PDF, DOCX, PPTX, XLSX, TXT, Markdown, CSV, HTML, Images, and more</p>
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
+    st.markdown(
+        """
+        <div style="border:2px dashed #c7d2fe;border-radius:16px;padding:1rem 1.3rem;margin-bottom:1rem;background:#f8fafc;">
+            <div style="display:flex;gap:1rem;align-items:center;flex-wrap:wrap;">
+                <div style="font-size:2rem;">📄</div>
+                <div>
+                    <p style="margin:0;font-weight:600;color:#0f172a;">Drag & drop files or choose from your computer</p>
+                    <p style="margin:0;color:#475569;font-size:0.9rem;">Multiple files are supported. Documents over 40MB are best handled on the local/Docker build.</p>
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
     uploaded_files = st.file_uploader(
-        "Select documents to upload",
+        label="Upload Documents",
         type=[
             "pdf",
             "txt",
@@ -3273,16 +3934,51 @@ def main():
             "webp",
         ],
         accept_multiple_files=True,
+        label_visibility="collapsed",
         help="Supported file types include common document, spreadsheet, presentation, and image formats.",
     )
 
     # Display uploaded file names for better user experience
     if uploaded_files:
-        st.subheader("Uploaded Files:")
-        for i, file in enumerate(uploaded_files):
-            st.markdown(f"- {file.name}")
+        st.markdown(
+            """
+            <div style="border:1px solid #e5e7eb;border-radius:16px;padding:1rem 1.2rem;margin-bottom:1rem;background:#ffffff;">
+                <h4 style="margin:0 0 0.6rem;color:#0f172a;">Uploaded Files</h4>
+            """,
+            unsafe_allow_html=True,
+        )
+        for file in uploaded_files:
+            size_kb = f"{len(file.getvalue()) / 1024:.1f} KB"
+            st.markdown(
+                f"""
+                <div style="display:flex;align-items:center;justify-content:space-between;border:1px solid #f1f5f9;border-radius:12px;padding:0.7rem 1rem;margin-bottom:0.5rem;">
+                    <div style="display:flex;align-items:center;gap:0.75rem;">
+                        <span style="font-size:1.4rem;">🗂️</span>
+                        <div>
+                            <p style="margin:0;color:#0f172a;font-weight:600;">{file.name}</p>
+                            <p style="margin:0;color:#475569;font-size:0.85rem;">{size_kb}</p>
+                        </div>
+                    </div>
+                    <span style="color:#2563eb;font-size:0.85rem;">Queued</span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        st.markdown("</div>", unsafe_allow_html=True)
     else:
-        st.info("No files selected yet.")
+        st.markdown(
+            """
+            <div style="border:1px dashed #cbd5f5;background:#f8fafc;border-radius:16px;padding:1rem 1.2rem;text-align:center;">
+                <p style="margin:0;color:#1e3a8a;font-size:0.95rem;">
+                    No files selected yet. Drag and drop documents above or click to browse your computer.
+                </p>
+                <p style="margin:0.3rem 0 0;color:#475569;font-size:0.85rem;">
+                    Need a sample? Try uploading a small PDF or DOCX to get started.
+                </p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
     # Input validation for the main processing button
     can_process = bool(
@@ -3296,7 +3992,25 @@ def main():
             "Please ensure Pinecone API Key, OpenAI API Key, Pinecone Index Name are set and at least one file is uploaded to enable processing."
         )
 
-    if st.button("🚀 Process, Embed & Upsert to Pinecone", disabled=not can_process):
+    st.markdown(
+        """
+        <div style="background:linear-gradient(135deg,#2563eb,#1e3a8a);border-radius:18px;padding:1rem 1.3rem;margin-bottom:1rem;color:white;box-shadow:0 12px 28px rgba(37,99,235,0.25);">
+            <div style="display:flex;align-items:center;gap:0.8rem;flex-wrap:wrap;">
+                <div style="font-size:2rem;">🚀</div>
+                <div>
+                    <p style="margin:0;font-weight:600;font-size:1rem;">Process, Embed & Upsert</p>
+                    <p style="margin:0;opacity:0.85;font-size:0.9rem;">Runs extraction, chunking, filtering, OpenAI embeddings, and Pinecone upserts in sequence.</p>
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if st.button(
+        "Start Processing",
+        disabled=not can_process,
+        use_container_width=True,
+    ):
         logger.info("Process, Embed & Upsert button clicked.")
         logger.debug(
             f"Pinecone Index: {pinecone_index_name}, Namespace: {namespace or 'default'}, Region: {pinecone_cloud_region}"
@@ -3319,6 +4033,28 @@ def main():
             if k.strip()
         }
         logger.info(f"Parsed whitelisted keywords: {whitelisted_keywords_set}")
+
+        # --- CLOUD RESOURCE SAFETY GATES ---
+        if uploaded_files and IS_ON_HF:
+            if len(uploaded_files) > 15:
+                st.error(
+                    "Cloud limit reached: 15 files per session. Use the Local Docker version for bulk ingestion."
+                )
+                logger.warning(
+                    "User attempted to upload more than 15 files on Hugging Face."
+                )
+                return
+
+            for f in uploaded_files:
+                if f.size > 40 * 1024 * 1024:  # 40MB limit
+                    st.error(
+                        f"File '{f.name}' is too large for the cloud (limit 40MB). Use the Local Docker version for large books."
+                    )
+                    logger.warning(
+                        f"User attempted to upload a file over 40MB: {f.name}"
+                    )
+                    return
+        # ----------------------------------
 
         # Process global custom metadata from UI inputs
         parsed_global_custom_metadata = {}
@@ -3354,73 +4090,95 @@ def main():
         # Process document-specific metadata file if uploaded
         document_specific_metadata_map = {}
         if document_metadata_file:
-            try:
-                file_content = document_metadata_file.getvalue().decode("utf-8")
-                if document_metadata_file.type == "text/csv":
-                    df = pd.read_csv(io.StringIO(file_content))
-                    if "file_name" not in df.columns:
-                        raise ValueError(
-                            "CSV metadata file must contain a 'file_name' column."
-                        )
-                    for _, row in df.iterrows():
-                        file_name_val = str(
-                            row["file_name"]
-                        ).lower()  # Normalize file_name from CSV
-                        doc_md = {}
-                        for k, v in row.drop("file_name").items():
-                            if k not in RESERVED_METADATA_KEYS:
-                                try:
-                                    parsed_v = json.loads(str(v))
-                                    doc_md[k] = parsed_v
-                                except (json.JSONDecodeError, TypeError):
-                                    doc_md[k] = str(v)
-                            else:
-                                logger.warning(
-                                    f"Document-specific CSV metadata for '{file_name_val}': Key '{k}' is reserved and will be ignored."
-                                )
-                        document_specific_metadata_map[file_name_val] = doc_md
-                    logger.info(
-                        f"Loaded {len(document_specific_metadata_map)} document-specific metadata entries from CSV."
-                    )
-                elif document_metadata_file.type == "application/json":
-                    json_data = json.loads(file_content)
-                    if not isinstance(json_data, list):
-                        raise ValueError(
-                            "JSON metadata file must be an array of objects."
-                        )
-                    for entry in json_data:
-                        if "file_name" not in entry:
-                            raise ValueError(
-                                "Each object in JSON metadata array must contain a 'file_name' key."
-                            )
-                        file_name_val = str(
-                            entry["file_name"]
-                        ).lower()  # Normalize file_name from JSON
-                        cleaned_entry = {}
-                        for k, v in entry.items():
-                            if k == "file_name":
+            file_bytes = document_metadata_file.getvalue()
+            file_hash = hashlib.sha256(file_bytes).hexdigest()
+            file_signature = f"{document_metadata_file.name}:{file_hash}"
+            needs_parse = (
+                st.session_state.document_metadata_file_signature != file_signature
+            )
+
+            if needs_parse:
+                try:
+                    # 1. Handle Encoding (Try UTF-8, fallback to Latin-1 for Excel exports)
+                    try:
+                        file_content = file_bytes.decode("utf-8")
+                    except UnicodeDecodeError:
+                        file_content = file_bytes.decode("latin-1")
+
+                    fname_lower = document_metadata_file.name.lower()
+                    parsed_map = {}
+
+                    # 2. Process CSV Files
+                    if fname_lower.endswith(".csv"):
+                        df = pd.read_csv(io.StringIO(file_content), sep=None, engine="python")
+                        df.columns = [
+                            str(c).lower().replace(" ", "_").strip() for c in df.columns
+                        ]
+                        if "file_name" not in df.columns:
+                            st.error("Missing Column: Your CSV must have a column named 'file_name'.")
+                            return
+                        df = df.fillna("")
+
+                        for _, row in df.iterrows():
+                            target_file = str(row["file_name"]).lower().strip()
+                            doc_md = {}
+                            for k, v in row.drop("file_name").items():
+                                if k in RESERVED_METADATA_KEYS or v == "":
+                                    continue
+                                val_str = str(v).strip()
+                                if val_str.lower() == "true":
+                                    doc_md[k] = True
+                                elif val_str.lower() == "false":
+                                    doc_md[k] = False
+                                else:
+                                    try:
+                                        doc_md[k] = json.loads(val_str)
+                                    except Exception:
+                                        doc_md[k] = val_str
+                            parsed_map[target_file] = doc_md
+
+                    # 3. Process JSON Files
+                    elif fname_lower.endswith(".json"):
+                        json_data = json.loads(file_content)
+                        if not isinstance(json_data, list):
+                            st.error("JSON Error: The file must contain a list of objects: `[{...}, {...}]`")
+                            return
+
+                        for entry in json_data:
+                            clean_entry = {
+                                str(k).lower().replace(" ", "_"): v for k, v in entry.items()
+                            }
+                            if "file_name" not in clean_entry:
                                 continue
-                            if k not in RESERVED_METADATA_KEYS:
-                                cleaned_entry[k] = v
-                            else:
-                                logger.warning(
-                                    f"Document-specific JSON metadata for '{file_name_val}': Key '{k}' is reserved and will be ignored."
-                                )
-                        document_specific_metadata_map[file_name_val] = cleaned_entry
-                    logger.info(
-                        f"Loaded {len(document_specific_metadata_map)} document-specific metadata entries from JSON."
+                            target_file = str(clean_entry.pop("file_name")).lower().strip()
+                            filtered_md = {
+                                k: v for k, v in clean_entry.items() if k not in RESERVED_METADATA_KEYS
+                            }
+                            parsed_map[target_file] = filtered_md
+                    else:
+                        st.error("Unsupported metadata file type. Use .csv or .json.")
+                        return
+
+                    st.session_state.document_specific_metadata_map = parsed_map
+                    st.session_state.document_metadata_file_signature = file_signature
+                    st.success(
+                        f"✅ Metadata Loaded: Found settings for {len(parsed_map)} files."
                     )
-                st.success(
-                    f"Successfully loaded document-specific metadata from '{document_metadata_file.name}'."
-                )
-            except Exception as e:
-                logger.exception(
-                    f"Error processing document-specific metadata file '{document_metadata_file.name}'."
-                )
-                st.error(
-                    f"Error processing document-specific metadata file: {e}. Please check its format."
-                )
-                return
+                    logger.info(
+                        f"Metadata map built with {len(parsed_map)} entries (signature {file_signature})."
+                    )
+                except Exception as e:
+                    logger.exception("Metadata File Error")
+                    st.error(f"Failed to read metadata file: {e}")
+                    return
+            document_specific_metadata_map = st.session_state.document_specific_metadata_map
+        else:
+            if st.session_state.document_metadata_file_signature is not None:
+                logger.info("Metadata file removed; clearing cached document metadata map.")
+            st.session_state.document_specific_metadata_map = {}
+            st.session_state.document_metadata_file_signature = None
+            document_specific_metadata_map = {}
+
 
         # Initialize Pinecone client
         try:
@@ -3443,6 +4201,13 @@ def main():
         plan_summary_messages = []
 
         st.subheader("Processing Plan Summary")
+        st.markdown(
+            """
+            <div style="border:1px solid #e5e7eb;border-radius:16px;padding:1rem 1.3rem;margin-bottom:1rem;background:#fcfdff;">
+                <p style="margin:0 0 0.4rem;color:#475569;">Each file is evaluated before processing. You'll see whether it will be processed, skipped, or overwritten.</p>
+            """,
+            unsafe_allow_html=True,
+        )
         plan_summary_placeholder = st.empty()
 
         manifest_entries = _load_manifest()
@@ -3457,7 +4222,7 @@ def main():
             status_message = ""
             should_process = True
 
-            if pc and pc.has_index(pinecone_index_name):
+            if pc and pinecone_has_index_cached(pc, pinecone_index_name, logger, pinecone_api_key):
                 idx = pc.Index(pinecone_index_name)
                 if overwrite_existing_docs:
                     status_message = f"🔄 '{original_file_name}': Overwrite enabled. Existing records will be removed."
@@ -3521,10 +4286,17 @@ def main():
                     (uploaded_file, document_id, normalized_file_name)
                 )
 
-            with plan_summary_placeholder.container():
-                for msg in plan_summary_messages:
-                    st.markdown(f"- {msg}")
-            time.sleep(0.05)
+        formatted_msgs = "\n".join(
+            f"<li style='margin-bottom:0.2rem;'>{msg}</li>"
+            for msg in plan_summary_messages
+        )
+        with plan_summary_placeholder.container():
+            st.markdown(
+                f"<ul style='padding-left:1.2rem;color:#0f172a;'>{formatted_msgs}</ul>",
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("</div>", unsafe_allow_html=True)
 
         logger.info(f"Initial file processing plan generated: {plan_summary_messages}")
         if not files_to_process_plan:
@@ -3539,7 +4311,7 @@ def main():
         st.subheader("Document Processing Progress")
 
         # Create Pinecone index if it doesn't exist
-        if pc and not pc.has_index(pinecone_index_name):
+        if pc and not pinecone_has_index_cached(pc, pinecone_index_name, logger, pinecone_api_key):
             conf = SUPPORTED_PINECONE_REGIONS.get(
                 pinecone_cloud_region, SUPPORTED_PINECONE_REGIONS["aws-us-east-1"]
             )
@@ -3548,20 +4320,48 @@ def main():
             )
             st.info(f"Creating Pinecone index '{pinecone_index_name}'...")
             with st.spinner("Waiting for index to become ready..."):
-                pc.create_index(
-                    name=pinecone_index_name,
-                    dimension=int(embedding_dimension),
-                    metric=metric_type,
-                    spec=ServerlessSpec(cloud=conf["cloud"], region=conf["region"]),
-                )
-                while not pc.describe_index(pinecone_index_name).status["ready"]:
-                    time.sleep(1)
+                try:
+                    pc.create_index(
+                        name=pinecone_index_name,
+                        dimension=int(embedding_dimension),
+                        metric=metric_type,
+                        spec=ServerlessSpec(cloud=conf["cloud"], region=conf["region"]),
+                    )
+                except Exception as create_err:
+                    logger.exception("Failed to create Pinecone index.")
+                    st.error(f"Failed to create index '{pinecone_index_name}': {create_err}")
+                    return
+
+                max_wait_seconds = 180  # 3 minutes
+                poll_interval = 2
+                waited = 0
+                while waited < max_wait_seconds:
+                    try:
+                        status_response = pc.describe_index(pinecone_index_name)
+                        is_ready = status_response.status.get("ready") if hasattr(status_response, "status") else status_response.get("status", {}).get("ready")
+                        if is_ready:
+                            break
+                    except Exception as status_err:
+                        logger.warning(f"Error polling index status: {status_err}")
+                    time.sleep(poll_interval)
+                    waited += poll_interval
+                else:
+                    error_msg = (
+                        f"Pinecone index '{pinecone_index_name}' did not become ready "
+                        f"within {max_wait_seconds} seconds. Please check your Pinecone console."
+                    )
+                    st.error(error_msg)
+                    logger.error(error_msg)
+                    return
+            cache = st.session_state.setdefault("pinecone_has_index_cache", {})
+            scope = pinecone_api_key or "default"
+            cache[f"has_index::{scope}::{pinecone_index_name}"] = True
             st.success(f"Pinecone index '{pinecone_index_name}' is ready.")
             logger.info(f"Pinecone index '{pinecone_index_name}' created and is ready.")
 
         index = (
             pc.Index(pinecone_index_name)
-            if pc and pc.has_index(pinecone_index_name)
+            if pc and pinecone_has_index_cached(pc, pinecone_index_name, logger, pinecone_api_key)
             else None
         )
         if not index:
@@ -3575,6 +4375,24 @@ def main():
             files_to_process_plan
         ):
             original_file_name = uploaded_file.name  # Keep original for display
+
+            st.markdown(
+                f"""
+                <div style="border:1px solid #e5e7eb;border-radius:16px;padding:0.8rem 1rem;margin-bottom:1rem;background:#ffffff;box-shadow:0 8px 20px rgba(15,23,42,0.05);">
+                    <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.6rem;">
+                        <div>
+                            <p style="margin:0;color:#0f172a;font-weight:600;">{original_file_name}</p>
+                            <p style="margin:0;color:#475569;font-size:0.87rem;">Document {file_idx + 1} of {total_files_to_process}</p>
+                        </div>
+                        <span style="background:#e0f2ff;color:#0369a1;padding:0.25rem 0.8rem;border-radius:999px;font-size:0.85rem;">
+                            Processing
+                        </span>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
             with st.status(
                 f"Processing document: **{original_file_name}** ({file_idx + 1}/{total_files_to_process})",
                 expanded=True,
@@ -3585,6 +4403,7 @@ def main():
                         label=f"Processing document: **{original_file_name}** - Saving to temporary storage...",
                         state="running",
                     )
+
                     file_path, temp_dir, file_bytes = save_uploaded_file_to_temp(
                         uploaded_file
                     )
@@ -3642,28 +4461,28 @@ def main():
                         label=f"Processing document: **{original_file_name}** - Loading content...",
                         state="running",
                     )
+                    status_container.update(
+                        label=f"Parsing and Sanitizing **{original_file_name}**...",
+                        state="running",
+                    )
+
                     loader = UnstructuredLoader(
                         file_path, strategy=unstructured_strategy
                     )
-                    # --- UPDATED LOADING LOGIC ---
-                    loader = UnstructuredLoader(
-                        file_path, strategy=unstructured_strategy
-                    )
-                    
                     initial_elements = list(loader.lazy_load())
-                    
+
                     raw_elements = []
                     for element in initial_elements:
-                        original_text = element.page_content or ""
-                        clean_text = surgical_text_cleaner(original_text)
-                        
+                        clean_text = surgical_text_cleaner(element.page_content or "")
                         if clean_text.strip():
                             element.page_content = clean_text
                             raw_elements.append(element)
 
                     status_container.write(
-                        f"Loaded {len(initial_elements)} parts. Sanitized down to {len(raw_elements)} clean elements."
+                        f"✅ Loaded {len(initial_elements)} parts. Sanitized to {len(raw_elements)} elements."
                     )
+                    logger.info(f"Loaded and sanitized {original_file_name}")
+
                     status_container.write(
                         f"Loaded {len(raw_elements)} raw parts using '{unstructured_strategy}' strategy."
                     )
@@ -3744,7 +4563,7 @@ def main():
                         continue
 
                     status_container.update(
-                        label=f"Processing document: **{original_file_name}** - Generating semantic child chunks...",
+                        label=f"Finding logical topic breaks in **{original_file_name}**...",
                         state="running",
                     )
                     child_chunks, current_parent_to_child_map = _generate_child_chunks(
@@ -3769,7 +4588,7 @@ def main():
                         f"'{original_file_name}': Child chunk generation complete."
                     )
                     status_container.update(
-                        label=f"Processing document: **{original_file_name}** - Summarizing special content (tables, figures, images)...",
+                        label=f"Describing tables and images in **{original_file_name}**...",
                         state="running",
                     )
                     special_content_child_chunks = _process_special_elements(
@@ -3838,11 +4657,15 @@ def main():
                                 f"{truncated_count} chunks for '{original_file_name}' were truncated by metadata shrinking."
                             )
 
+                        total_file_tokens = sum(chunk_token_lengths)
                         logger.info(
-                            f"Chunk token stats for '{original_file_name}': "
-                            f"min={min_tokens}, max={max_tokens}, avg={avg_tokens:.1f}, "
-                            f"count={len(chunk_token_lengths)}"
+                            f"PROCESSED: '{original_file_name}' | "
+                            f"Total Chunks: {len(all_embeddable_child_chunks)} | "
+                            f"Total Tokens: {total_file_tokens:,} | "
+                            f"Avg Tokens/Chunk: {avg_tokens:.1f}"
                         )
+                        if total_file_tokens > 100000:
+                            logger.warning(f"Large document detected: '{original_file_name}' ({total_file_tokens:,} tokens). Ingestion may be slow.")
 
                     # Embedding and Upserting for the current file's chunks
                     status_container.update(
@@ -3855,68 +4678,89 @@ def main():
                         dimensions=int(embedding_dimension),
                     )
 
-                    file_texts_to_embed = [
-                        c.metadata.pop("_embedding_text", c.page_content)
-                        for c in all_embeddable_child_chunks
+                    # 1. Load the local progress for this specific document
+                    doc_cache = load_doc_checkpoint(document_id)
+                    all_chunks = all_embeddable_child_chunks
+
+                    # 2. Filter for chunks that still need embedding
+                    missing_chunks = [
+                        c
+                        for c in all_chunks
+                        if c.metadata.get("child_chunk_id") not in doc_cache
                     ]
+
                     file_vectors = []
-                    current_batch_texts = []
-                    current_batch_tokens = 0
 
-                    for i, text in enumerate(file_texts_to_embed):
-                        text_tokens = count_tokens(text, embedding_model_name, logger)
-
-                        if text_tokens > OPENAI_MAX_TOKENS_PER_EMBEDDING_REQUEST:
-                            error_msg = (
-                                f"Chunk {i+1}/{len(file_texts_to_embed)} of '{original_file_name}' "
-                                f"contains {text_tokens} tokens, which exceeds the embedding model limit "
-                                f"({OPENAI_MAX_TOKENS_PER_EMBEDDING_REQUEST}). "
-                                "Please reduce the chunk size or adjust filtering settings."
-                            )
-                            logger.error(error_msg)
-                            st.error(error_msg)
-                            raise ValueError(error_msg)
-
-                        if (
-                            current_batch_tokens + text_tokens
-                            > OPENAI_MAX_TOKENS_PER_EMBEDDING_REQUEST
-                        ) or (
-                            len(current_batch_texts)
-                            >= OPENAI_MAX_TEXTS_PER_EMBEDDING_REQUEST
-                        ):
-
-                            if current_batch_texts:
-                                logger.debug(
-                                    f"Embedding batch of {len(current_batch_texts)} texts ({current_batch_tokens} tokens) for '{original_file_name}'."
-                                )
-                                batch_vectors = embed_model.embed_documents(
-                                    current_batch_texts
-                                )
-                                file_vectors.extend(batch_vectors)
-
-                            current_batch_texts = [text]
-                            current_batch_tokens = text_tokens
-                        else:
-                            current_batch_texts.append(text)
-                            current_batch_tokens += text_tokens
-
+                    if missing_chunks:
+                        logger.info(
+                            f"Resuming {original_file_name}: {len(missing_chunks)} new chunks to embed."
+                        )
                         status_container.write(
-                            f"Generating embeddings for '{original_file_name}': {i+1}/{len(file_texts_to_embed)} chunks."
+                            f"🔄 Resuming: {len(all_chunks) - len(missing_chunks)} cached, {len(missing_chunks)} new."
                         )
 
-                    if current_batch_texts:
-                        logger.debug(
-                            f"Embedding final batch of {len(current_batch_texts)} texts ({current_batch_tokens} tokens) for '{original_file_name}'."
-                        )
-                        batch_vectors = embed_model.embed_documents(current_batch_texts)
-                        file_vectors.extend(batch_vectors)
+                        texts_to_send = [
+                            c.metadata.get("_embedding_text", c.page_content)
+                            for c in missing_chunks
+                        ]
 
-                    status_container.write(
-                        f"Generated {len(file_vectors)} embeddings for '{original_file_name}'."
-                    )
-                    logger.info(
-                        f"Generated {len(file_vectors)} embeddings for '{original_file_name}'."
-                    )
+                        current_batch_texts = []
+                        current_batch_tokens = 0
+                        new_vectors = []
+
+                        for i, text in enumerate(texts_to_send):
+                            text_tokens = count_tokens(
+                                text, embedding_model_name, logger
+                            )
+
+                            if text_tokens > OPENAI_MAX_TOKENS_PER_EMBEDDING_REQUEST:
+                                error_msg = f"Chunk {i+1} of '{original_file_name}' exceeds embedding limit."
+                                logger.error(error_msg)
+                                raise ValueError(error_msg)
+
+                            if (
+                                current_batch_tokens + text_tokens
+                                > OPENAI_MAX_TOKENS_PER_EMBEDDING_REQUEST
+                            ) or (
+                                len(current_batch_texts)
+                                >= OPENAI_MAX_TEXTS_PER_EMBEDDING_REQUEST
+                            ):
+
+                                if current_batch_texts:
+                                    batch_vectors = embed_model.embed_documents(
+                                        current_batch_texts
+                                    )
+                                    new_vectors.extend(batch_vectors)
+                                current_batch_texts = [text]
+                                current_batch_tokens = text_tokens
+                            else:
+                                current_batch_texts.append(text)
+                                current_batch_tokens += text_tokens
+
+                            status_container.write(
+                                f"Generating new embeddings: {len(new_vectors) + len(current_batch_texts)}/{len(texts_to_send)}"
+                            )
+
+                        if current_batch_texts:
+                            batch_vectors = embed_model.embed_documents(
+                                current_batch_texts
+                            )
+                            new_vectors.extend(batch_vectors)
+
+                        # 3. Update the checkpoint on disk immediately
+                        for c, vec in zip(missing_chunks, new_vectors):
+                            doc_cache[c.metadata["child_chunk_id"]] = vec
+                        save_doc_checkpoint(document_id, doc_cache)
+                        logger.info(f"Checkpoint saved for {original_file_name}")
+                    else:
+                        status_container.write(
+                            "✅ All embeddings recovered from local cache."
+                        )
+
+                    # 4. Reconstruct the final vector list for Pinecone
+                    file_vectors = [
+                        doc_cache[c.metadata["child_chunk_id"]] for c in all_chunks
+                    ]
 
                     if len(file_vectors) != len(all_embeddable_child_chunks):
                         raise ValueError(
@@ -3944,15 +4788,11 @@ def main():
                                 f"Metadata 'text' field missing for chunk '{chunk_id}'. Added from page_content."
                             )
 
-                        # Metadata should already be canonicalized and shrunk in _generate_child_chunks or _process_special_elements
-                        # No need for a second _shrink_metadata_to_limit call here.
+                        c.metadata.pop("_embedding_text", None)
+
                         final_metadata_for_upsert = c.metadata
-
-                        # The "truncated AGAIN" warning should no longer appear if the metadata was properly handled upstream.
-                        # If it still appears, it indicates a deeper issue in the _shrink_metadata_to_limit function itself
-                        # or an extremely large chunk that cannot fit even minimal metadata.
-
                         file_records.append((chunk_id, vec, final_metadata_for_upsert))
+
                     logger.info(
                         f"Prepared {len(file_records)} records for upsert for '{original_file_name}'."
                     )
@@ -3980,6 +4820,9 @@ def main():
                     logger.info(
                         f"Successfully processed and upserted all records for '{original_file_name}'."
                     )
+                    clear_doc_checkpoint(
+                        document_id
+                    )  # Process 100% complete, delete temp cache
                     _append_manifest_entry(
                         document_id=document_id, file_name=normalized_file_name
                     )
@@ -4003,15 +4846,72 @@ def main():
                             f"Cleaned up temp directory for '{original_file_name}': {temp_dir}"
                         )
 
-        st.success(
-            "All selected documents have been processed (or skipped as per plan)."
+        st.markdown(
+            """
+            <div style="background:linear-gradient(135deg,#22c55e,#16a34a);border-radius:18px;padding:1.1rem 1.4rem;margin:1.2rem 0;color:white;box-shadow:0 14px 32px rgba(34,197,94,0.25);">
+                <div style="display:flex;align-items:center;gap:0.9rem;flex-wrap:wrap;">
+                    <div style="font-size:2rem;">✅</div>
+                    <div>
+                        <p style="margin:0;font-size:1.05rem;font-weight:600;">Ingestion Complete</p>
+                        <p style="margin:0;opacity:0.9;font-size:0.92rem;">All selected documents have been processed or skipped per your plan. You can now explore them via the "Manage Documents" section below.</p>
+                    </div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
         logger.info("All selected documents processing complete.")
 
+
         try:
             stats = index.describe_index_stats()
-            st.info(f"Final index stats: {stats.to_dict()}")
-            logger.info(f"Final index stats: {stats.to_dict()}")
+            stats_dict = stats.to_dict()
+            total_vectors = stats_dict.get("total_vector_count", "N/A")
+            if isinstance(total_vectors, (int, float)):
+                total_vectors_display = f"{total_vectors:,}"
+            else:
+                total_vectors_display = str(total_vectors)
+
+            namespaces = stats_dict.get("namespaces", {})
+
+            st.markdown(
+                """
+                <div style="border:1px solid #dbeafe;background:#eff6ff;border-radius:18px;padding:1rem 1.3rem;margin-bottom:1rem;">
+                    <h4 style="margin:0 0 0.4rem;color:#1d4ed8;">Final Index Summary</h4>
+                """,
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f"""
+                <p style="margin:0;color:#0f172a;font-size:0.95rem;">
+                    • Total vectors: <strong>{total_vectors_display}</strong>
+                </p>
+                """,
+                unsafe_allow_html=True,
+            )
+            if namespaces:
+                st.markdown(
+                    "<p style='margin:0.6rem 0 0;color:#1e3a8a;font-size:0.9rem;'>Namespace breakdown:</p>",
+                    unsafe_allow_html=True,
+                )
+                for ns_name, ns_data in namespaces.items():
+                    ns_vectors = ns_data.get("vector_count", "N/A")
+                    ns_vectors_display = (
+                        f"{ns_vectors:,}" if isinstance(ns_vectors, (int, float)) else str(ns_vectors)
+                    )
+                    display_ns_name = ns_name if ns_name else "Default (`''`)"
+                    st.markdown(
+                        f"<p style='margin:0;color:#0f172a;font-size:0.88rem;'>• {display_ns_name}: <strong>{ns_vectors_display}</strong> vectors</p>",
+                        unsafe_allow_html=True,
+                    )
+            else:
+                st.markdown(
+                    "<p style='margin:0.6rem 0 0;color:#475569;font-size:0.9rem;'>No namespace-specific data returned.</p>",
+                    unsafe_allow_html=True,
+                )
+            st.markdown("</div>", unsafe_allow_html=True)
+
+            logger.info(f"Final index stats: {stats_dict}")
         except Exception as e:
             logger.exception("Failed to retrieve final index stats.")
             st.info("Final index stats unavailable.")
@@ -4024,17 +4924,58 @@ def main():
 
     # Application Logs section
     st.markdown("---")
-    st.header("Application Logs")
-    with st.expander("View Logs", expanded=False):
-        log_display_area = st.empty()
-        log_display_area.code(
-            "\n".join(reversed(st.session_state.streamlit_handler.get_records()))
+    st.header("🛠️ System Diagnostics")
+    st.markdown(
+        """
+        <div style="border:1px solid #e5e7eb;border-radius:16px;padding:1rem 1.3rem;margin-bottom:1rem;background:#f8fafc;">
+            <p style="margin:0;color:#475569;font-size:0.92rem;">
+                Review application logs, wipe browser-side configuration caches (Hugging Face), or clear the in-app log history.
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if IS_ON_HF:
+        st.markdown(
+            """
+            <div style="border:1px solid #e0f2fe;background:#ecfeff;border-radius:12px;padding:0.9rem 1rem;margin-bottom:0.8rem;">
+                <p style="margin:0;color:#0369a1;font-size:0.9rem;">
+                    💡 Your API keys and settings are stored locally in your browser's cache. Nothing is stored on the server.
+                </p>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
-        if st.button("Clear Logs", key="clear_logs_button"):
-            st.session_state.streamlit_handler.log_records.clear()
-            log_display_area.code("")
-            logger.info("Application logs cleared by user.")
+        if st.button(
+            "🗑️ Wipe Browser Cache",
+            help="Permanently delete your saved settings from this browser.",
+            use_container_width=True,
+        ):
+            sync_browser_storage(action="clear")
 
+    with st.expander("View Application Logs", expanded=False):
+        if "streamlit_handler" in st.session_state:
+            records = st.session_state.streamlit_handler.get_records()
+            if records:
+                current_id = st.session_state.session_id
+                display_logs = [r for r in records if current_id in r or "AppLogger_" not in r]
+                st.markdown(
+                    """
+                    <div style="border:1px solid #e2e8f0;border-radius:12px;padding:0.6rem 0.8rem;background:#1e1e1e;color:#f5f5f5;font-family:monospace;font-size:0.83rem;max-height:320px;overflow:auto;">
+                    """,
+                    unsafe_allow_html=True,
+                )
+                st.markdown(
+                    "<br>".join(reversed(display_logs)),
+                    unsafe_allow_html=True,
+                )
+                st.markdown("</div>", unsafe_allow_html=True)
+            else:
+                st.info("No activity logged yet.")
+        
+        if st.button("Clear History", use_container_width=True):
+            st.session_state.streamlit_handler.log_records.clear()
+            st.rerun()
 
 if __name__ == "__main__":
     main()
