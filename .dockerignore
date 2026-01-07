@@ -1,0 +1,15 @@
+.git
+.venv
+__pycache__
+*.pyc
+.ingest_cache
+pinecone_manifest.json
+.env
+*.pdf
+*.docx
+*.txt
+*.xlsx
+*.pptx
+*.jpg
+*.png
+create_structure.py

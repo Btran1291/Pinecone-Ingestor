@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+.env
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+rag_app_env/
+
+
+# Streamlit
+.streamlit/
+
+# Poetry
+.venv/
+poetry.lock
