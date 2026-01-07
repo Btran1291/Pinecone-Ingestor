@@ -1,186 +1,112 @@
+---
+license: mit
+title: Pinecone Ingestor
+sdk: docker
+emoji: 🚀
+colorFrom: indigo
+colorTo: blue
+short_description: A Streamlit app that ingests documents to Pinecone database.
+---
 # Pinecone Ingestor
 
-[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)  
-[![Streamlit](https://img.shields.io/badge/streamlit-v1.XX-green)](https://streamlit.io/)  
-[![Docker](https://img.shields.io/badge/docker-compatible-blue)](https://www.docker.com/)
+[![Python](https://img.shields.io/badge/python-3.11+-blue)](https://www.python.org/downloads/)
+[![Streamlit](https://img.shields.io/badge/streamlit-1.30+-green)](https://streamlit.io/)
+[![Docker](https://img.shields.io/badge/docker-ready-blue)](https://www.docker.com/)
+[![Spaces](https://img.shields.io/badge/🤗-Hugging%20Face%20Spaces-yellow)](https://huggingface.co/spaces/Btran1291/pinecone-ingestor)
+
+> 🎯 **Live Demo**: https://huggingface.co/spaces/Btran1291/pinecone-ingestor
 
 ---
 
-## Overview
+## 📚 Overview
 
-**Pinecone Ingestor** is a Streamlit web application designed to help you build and manage a Retrieval-Augmented Generation (RAG) knowledge base using Pinecone vector database. It enables ingestion of diverse document types into a Pinecone vector database by leveraging LangChain's `UnstructuredLoader` and advanced document processing pipelines.
+**Pinecone Ingestor** is a Streamlit application that turns documents into Pinecone vectors with zero code. It automates the complex process of cleaning, organizing, and uploading content to a Pinecone vector database for AI applications.
 
----
-
-## Installation
-
-### Prerequisites
-
-- Docker (version 20.10+ recommended) installed and running  
-  [Get Docker](https://docs.docker.com/get-docker/)  
-- Pinecone account with API key  
-  [Sign up at Pinecone](https://www.pinecone.io/start/)  
-- OpenAI API key (or compatible embedding API key)  
-  [Get OpenAI API key](https://platform.openai.com/account/api-keys)  
+The app runs locally (Docker or bare Streamlit) and on Hugging Face Spaces. On Spaces, API keys remain in the user’s browser storage, never on the server.
 
 ---
 
-### Clone the Repository
+## 🧠 Feature Highlights
+
+-   **🔍 Structural Awareness:** Identify headers, paragraphs, and tables during the conversion process, ensuring the original meaning and layout of your document are preserved.
+-   **🧼 Automated Text Cleaning:** Utilize a targeted cleaning engine to detect and remove commercial watermarks and software branding from within text blocks.
+-   **📉 Noise Reduction:** Automatically filter out visual artifacts such as repetitive symbols or stray characters often generated during PDF-to-text conversion.
+-   **🧠 Logic-Based Organizing:** Group sentences into units based on the ideas they represent rather than simple character counts. This ensures retrieved information remains coherent.
+-   **🖇️ Context Preservation:** Prevent fragmented results by automatically merging short introductory sentences or fragments into the next relevant paragraph.
+-   **⛓️ Sequential Mapping:** Link every piece of information to the content that preceded and followed it, allowing your AI to retrieve broader context when needed.
+
+---
+
+## ⚙️ Configuration Essentials
+
+| Setting | Purpose |
+|---------|---------|
+| **Pinecone API Key / Index / Region** | Connects to your vector store. Serverless index auto-created if absent. |
+| **OpenAI API Key / Embedding Model** | Uses `text-embedding-3-small` (1536 dims) by default. |
+| **Chunk Size & Overlap** | Fallback recursive splitter parameters (used if semantic chunker can’t split). |
+| **Semantic Threshold (type & amount)** | Controls how sensitive the semantic chunker is to topic shifts. |
+| **Filtering Controls** | Minimum lengths, keyword whitelist, SpaCy NER toggle, low-confidence retention. |
+| **Custom Metadata** | Global key/value pairs plus optional document-level metadata file (CSV/JSON with `file_name`). |
+| **Overwrite Existing Docs** | If enabled, removes prior vectors for the same document before ingestion. |
+
+All settings can be exported/imported as JSON profiles from the UI.
+
+---
+
+## 🚀 Running the App
+
+### 1. Run Locally with Docker (recommended)
+
+```bash
+docker run -p 8501:8501 \
+  -v $(pwd):/app \
+  khoit12/pinecone-ingestor:v1
+```
+
+PowerShell equivalent:
+
+```powershell
+docker run -p 8501:8501 -v ${PWD}:/app khoit12/pinecone-ingestor:v1
+```
+
+Then visit `http://localhost:8501`.
+
+### 2. Run Locally without Docker
 
 ```bash
 git clone https://github.com/Btran1291/Pinecone-Ingestor.git
-cd Pinecone-Ingestor
-```
-
----
-
-### Configuration
-
-The application supports configuring parameters via a `.env` file. This file should contain your API keys and other settings. The app creates and updates this file automatically when you save configuration through the UI.
-
-You can also create the file manually in the project root. If you choose to create the `.env` file manually, here is an example template. **Replace the placeholder values with your own:**
-
-```env
-PINECONE_API_KEY="your-pinecone-api-key"
-EMBEDDING_API_KEY="your-openai-api-key"
-PINECONE_INDEX_NAME="your-index-name"
-PINECONE_CLOUD_REGION="aws-us-east-1"
-EMBEDDING_MODEL_NAME="text-embedding-3-small"
-EMBEDDING_DIMENSION="1536"
-METRIC_TYPE="cosine"
-NAMESPACE=""
-CHUNK_SIZE="1000"
-CHUNK_OVERLAP="200"
-OVERWRITE_EXISTING_DOCS="False"
-ENABLE_FILTERING="True"
-WHITELISTED_KEYWORDS=""
-MIN_GENERIC_CONTENT_LENGTH="50"
-ENABLE_NER_FILTERING="True"
-UNSTRUCTURED_STRATEGY="hi_res"
-LOGGING_LEVEL="INFO"
-```
-
----
-
-### Build Docker Image
-
-Build the Docker image using the provided `Dockerfile`:
-
-```bash
-docker build -t pinecone-ingestor .
-```
-
-> **Note:** The Docker image is quite large (~14GB) due to the inclusion of multiple system dependencies (Poppler, Tesseract, LibreOffice, Pandoc, etc.) required for comprehensive document parsing. As a result, building the image may take awhile depending on your machine and network speed.
-
----
-
-### Run the Docker Container
-
-Run the container, mapping port 8501 and passing environment variables:
-
-```bash
-docker run -p 8501:8501 --env-file .env pinecone-ingestor
-```
-
----
-
-### Access the Application
-
-Open your browser and navigate to:
-
-```
-http://localhost:8501
-```
-
-You should see the Pinecone Ingestor UI.
-
----
-
-## Usage
-
-### 1. Configuration
-
-- Enter your Pinecone API key, OpenAI API key, and other parameters in the **Configuration** section.
-- Choose your Pinecone index name, cloud region, embedding model, and vector dimension.
-- Configure document processing parameters such as chunk size, chunk overlap, and filtering options.
-- Optionally upload document-specific metadata (CSV or JSON format).
-- Save or reset your configuration as needed.
-- Use the **Test API Connections** button to verify your keys.
-
-### 2. Upload Documents
-
-- Upload one or more documents in supported formats (e.g., PDF, DOCX, PPTX, TXT, CSV).
-- Click **Process, Embed & Upsert to Pinecone** to start ingestion.
-- Monitor progress and logs in real-time.
-
-### 3. Manage Documents
-
-- View Pinecone index status and vector counts.
-- Load and search document names within the current namespace.
-- View metadata for individual documents.
-- Delete specific documents or perform bulk deletion within the namespace.
-
-### 4. Application Logs
-
-- Access detailed logs for debugging and monitoring.
-- Clear logs as needed.
-
----
-
-## Supported Document Types
-
-Thanks to LangChain’s `UnstructuredLoader` and the `unstructured[all-docs]` package, this tool supports a wide range of document formats, including but not limited to:
-
-- PDF
-- Microsoft Word (.docx)
-- Microsoft PowerPoint (.pptx)
-- Microsoft Excel (.xlsx)
-- EPUB
-- Markdown (.md)
-- HTML/XML
-- CSV/TSV
-- Plain text (.txt)
-- Rich Text Format (.rtf)
-- Email (.eml)
-- Org-mode (.org)
-- ReStructuredText (.rst)
-
----
-
-## System Dependencies
-
-The Docker image includes all necessary system dependencies for document parsing and OCR:
-
-- Poppler utilities (`poppler-utils`)
-- Tesseract OCR (`tesseract-ocr` and language packs)
-- LibreOffice (for MS Office formats)
-- Pandoc (for EPUB and other conversions)
-- libmagic (file type detection)
-- Mesa GL (`libgl1-mesa-glx`) for image processing
-
----
-
-## Development
-
-### Install Poetry Dependencies Locally
-
-If you want to run the app locally without Docker:
-
-```bash
+cd pinecone-ingestor
 poetry install
 poetry run streamlit run app.py
 ```
 
-Make sure to install system dependencies like Poppler, Tesseract, LibreOffice, and Pandoc on your local machine to ensure full document support.
+### 3. Deploy on Hugging Face Spaces
+
+1. Visit the repository: https://huggingface.co/spaces/Btran1291/pinecone-ingestor/tree/main  
+2. Click **⋯ > Duplicate this Space** (or “Use this Space as a template”).  
+3. Choose **Streamlit** as the SDK and a GPU/CPU tier that meets your needs.  
+4. After the duplicate finishes building, open the Space and the UI should be running.
 
 ---
 
-## Contributing
+## 📁 Local Artifacts
 
-Contributions, issues, and feature requests are welcome! Please open an issue or submit a pull request.
+When running with `-v $(pwd):/app`, the app keeps everything in your working directory:
+
+- `.env` – stores API keys and configuration (local mode).
+- `.ingest_cache/` – per-document checkpoint files (resume embeddings).
+- `pinecone_manifest.json` – tracks document IDs ↔ filenames for quick deduplication.
+
+On Hugging Face, equivalent data is isolated per session ID in `/sessions/<uuid>`.
 
 ---
 
-## License
+## 🤝 Contributing
 
-This project is licensed under the MIT License.
+Contributions, issues, and feature requests are welcome!
+
+---
+
+## 📄 License
+
+Licensed under the MIT License.
